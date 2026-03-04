@@ -50,3 +50,4 @@ data/*
 # Project resources/docs not part of the runnable codebase
 ressources/
 matchs/
+outputs/
