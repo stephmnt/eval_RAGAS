@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -27,33 +28,69 @@ DEFAULT_QUESTIONS: list[dict[str, str]] = [
     {
         "id": "q1",
         "category": "simple",
-        "question": "Quelle equipe a gagne le match et quel est le score final ?",
-        "ground_truth": "La reponse doit identifier le vainqueur et le score final a partir du corpus source.",
+        "question": "Quel est le nom complet de l'equipe codee OKC ?",
+        "ground_truth": "OKC correspond a Oklahoma City Thunder.",
     },
     {
         "id": "q2",
         "category": "simple",
-        "question": "Quel joueur a marque le plus de points dans le match ?",
-        "ground_truth": "La reponse doit nommer le meilleur marqueur et son total de points.",
+        "question": "Selon le tableau des equipes, combien de points totaux a OKC ?",
+        "ground_truth": "OKC totalise 9880 points.",
     },
     {
         "id": "q3",
         "category": "complex",
-        "question": "Compare les rebonds a domicile et a l'exterieur, puis donne une conclusion.",
-        "ground_truth": "La reponse doit comparer les rebonds domicile/exterieur et formuler une conclusion claire.",
+        "question": "Parmi MIA, OKC, LAC et BKN, quelle equipe a le plus de points totaux ?",
+        "ground_truth": "Parmi ces quatre equipes, OKC est premier avec 9880 points.",
     },
     {
         "id": "q4",
         "category": "complex",
-        "question": "Quel joueur a le meilleur pourcentage a 3 points sur les cinq derniers matchs ?",
-        "ground_truth": "La reponse doit citer un joueur et une affirmation etayee sur le pourcentage a 3 points sur une fenetre de cinq matchs.",
+        "question": "Quelle est la difference de points totaux entre OKC (9880) et MIA (9828) ?",
+        "ground_truth": "La difference est de 52 points.",
     },
     {
         "id": "q5",
-        "category": "noisy",
-        "question": "domicile vs exterieur rebonds diff ??? insight rapide",
-        "ground_truth": "La reponse doit interpreter la demande bruitee et comparer les rebonds domicile vs exterieur.",
+        "category": "simple",
+        "question": "Combien de joueurs compte l'equipe Brooklyn Nets (BKN) ?",
+        "ground_truth": "BKN compte 20 joueurs.",
     },
+    {
+        "id": "q6",
+        "category": "simple",
+        "question": "Dans le top 15 des joueurs par points, combien de points totaux a Shai Gilgeous-Alexander ?",
+        "ground_truth": "Shai Gilgeous-Alexander affiche 2485 points totaux.",
+    },
+    {
+        "id": "q7",
+        "category": "simple",
+        "question": "Quel est le pourcentage a 3 points (3P%) de Shai Gilgeous-Alexander dans ce tableau ?",
+        "ground_truth": "Le 3P% de Shai Gilgeous-Alexander est de 37.5.",
+    },
+    {
+        "id": "q8",
+        "category": "complex",
+        "question": "Entre Anthony Edwards (2180) et Nikola Jokic (2072), qui a le plus de points totaux ?",
+        "ground_truth": "Anthony Edwards a le total le plus eleve avec 2180 points (contre 2072).",
+    },
+    {
+        "id": "q9",
+        "category": "complex",
+        "question": "Entre Detroit Pistons (10292) et Cleveland Cavaliers (10180), quelle equipe a le plus de points totaux ?",
+        "ground_truth": "Detroit Pistons est devant avec 10292 points (contre 10180).",
+    },
+    {
+        "id": "q10",
+        "category": "noisy",
+        "question": "code MIA -> equipe + points ??? reponse rapide",
+        "ground_truth": "MIA correspond a Miami Heat et le total affiche est de 9828 points.",
+    },
+    {
+        "id": "q11",
+        "category": "complex",
+        "question": "Entre Detroit Pistons (10292) et Cleveland Cavaliers (10180), quelle est la différence de points ?",
+        "ground_truth": "La différence est de 112 points.",
+    },    
 ]
 
 
@@ -84,6 +121,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Genere et sauvegarde uniquement les echantillons QA (sans metriques RAGAS).",
     )
+    parser.add_argument(
+        "--include-context-recall",
+        action="store_true",
+        help=(
+            "Active la metrique context_recall. A utiliser uniquement si ground_truth "
+            "contient une vraie reponse de reference (et non une consigne)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -112,14 +157,18 @@ def _load_questions(questions_file: str | None) -> list[dict[str, str]]:
 
 def _truncate_context(text: str, max_chars: int = 1200) -> str:
     clean = " ".join(text.split())
+    clean = re.sub(r"\bNaN\b", "", clean)
+    clean = re.sub(r"\s{2,}", " ", clean).strip()
     return clean[:max_chars]
 
 
 def _build_prompt(question: str, contexts: list[str]) -> str:
     formatted_context = "\n\n".join([f"[{i + 1}] {ctx}" for i, ctx in enumerate(contexts)])
     return (
-        "Reponds a la question uniquement avec les informations presentes dans le CONTEXTE. "
-        "Si le contexte est insuffisant, indique explicitement l'incertitude.\n\n"
+        "Reponds uniquement avec les informations presentes dans le CONTEXTE. "
+        "Si des valeurs numeriques sont presentes, cite-les explicitement. "
+        "Tu peux faire un calcul simple (difference, comparaison) uniquement a partir des valeurs du contexte. "
+        "Si l'information est absente, reponds exactement: Information non disponible dans le contexte.\n\n"
         f"CONTEXTE:\n{formatted_context}\n\n"
         f"QUESTION:\n{question}\n\n"
         "REPONSE FINALE:"
@@ -167,6 +216,7 @@ def _build_samples(
     for row in questions:
         search_results = retriever.search(row["question"], k=k, min_score=min_score)
         contexts = [_truncate_context(r.get("text", "")) for r in search_results]
+        contexts = [c for c in contexts if c and len(c.strip()) > 30]
         answer = _generate_answer(client, model, row["question"], contexts)
 
         sample = {
@@ -183,21 +233,44 @@ def _build_samples(
     return samples
 
 
-def _resolve_ragas_metrics() -> tuple[Any, list[Any]]:
+def _resolve_ragas_metrics(
+    *,
+    llm: Any,
+    embeddings: Any,
+    include_context_recall: bool,
+) -> tuple[Any, list[Any]]:
     from ragas import evaluate
-    from ragas.metrics import (
-        answer_relevancy,
-        context_precision,
-        context_recall,
-        faithfulness,
-    )
 
-    return evaluate, [
-        answer_relevancy,
-        faithfulness,
-        context_precision,
-        context_recall,
-    ]
+    try:
+        # API recommandee par RAGAS.
+        from ragas.metrics.collections import (
+            AnswerRelevancy,
+            ContextPrecision,
+            ContextRecall,
+            Faithfulness,
+        )
+
+        metrics = [
+            AnswerRelevancy(llm=llm, embeddings=embeddings),
+            Faithfulness(llm=llm),
+            ContextPrecision(llm=llm),
+        ]
+        if include_context_recall:
+            metrics.append(ContextRecall(llm=llm))
+        return evaluate, metrics
+    except Exception:
+        # Compatibilite ascendante selon la version installee.
+        from ragas.metrics import (
+            answer_relevancy,
+            context_precision,
+            context_recall,
+            faithfulness,
+        )
+
+        metrics = [answer_relevancy, faithfulness, context_precision]
+        if include_context_recall:
+            metrics.append(context_recall)
+        return evaluate, metrics
 
 def _resolve_ragas_models() -> tuple[Any | None, Any | None]:
     try:
@@ -209,15 +282,51 @@ def _resolve_ragas_models() -> tuple[Any | None, Any | None]:
         from ragas.embeddings import LangchainEmbeddingsWrapper
         from ragas.llms import LangchainLLMWrapper
 
+        # Contournement d'un bug connu: certaines reponses Mistral renvoient
+        # des token_usage imbriques (dict dans dict), ce qui casse l'addition
+        # naive de langchain-mistralai.
+        class SafeChatMistralAI(ChatMistralAI):
+            def _combine_llm_outputs(self, llm_outputs: list[dict | None]) -> dict:
+                overall_token_usage: dict[str, Any] = {}
+
+                for output in llm_outputs:
+                    if not output:
+                        continue
+                    token_usage = output.get("token_usage")
+                    if not token_usage:
+                        continue
+
+                    for key, value in token_usage.items():
+                        if isinstance(value, (int, float)):
+                            overall_token_usage[key] = overall_token_usage.get(key, 0) + value
+                            continue
+
+                        if isinstance(value, dict):
+                            previous = overall_token_usage.get(key, {})
+                            if not isinstance(previous, dict):
+                                previous = {}
+                            merged = dict(previous)
+                            for sub_key, sub_value in value.items():
+                                if isinstance(sub_value, (int, float)):
+                                    merged[sub_key] = merged.get(sub_key, 0) + sub_value
+                                else:
+                                    merged[sub_key] = sub_value
+                            overall_token_usage[key] = merged
+                            continue
+
+                        overall_token_usage[key] = value
+
+                return {"token_usage": overall_token_usage, "model_name": self.model}
+
         # Les versions de `langchain-mistralai` varient legerement sur les noms d'arguments.
         try:
-            llm_model = ChatMistralAI(
+            llm_model = SafeChatMistralAI(
                 model=MODEL_NAME,
                 temperature=0.0,
                 api_key=MISTRAL_API_KEY,
             )
         except TypeError:
-            llm_model = ChatMistralAI(
+            llm_model = SafeChatMistralAI(
                 model=MODEL_NAME,
                 temperature=0.0,
                 mistral_api_key=MISTRAL_API_KEY,
@@ -233,6 +342,22 @@ def _resolve_ragas_models() -> tuple[Any | None, Any | None]:
                 model="mistral-embed",
                 mistral_api_key=MISTRAL_API_KEY,
             )
+
+        # Sanity check embeddings: evite les NaN silencieux plus tard dans RAGAS.
+        try:
+            if hasattr(embed_model, "embed_query"):
+                vec = embed_model.embed_query("hello")
+            elif hasattr(embed_model, "embed_documents"):
+                vec = embed_model.embed_documents(["hello"])[0]
+            else:
+                raise RuntimeError("Le modele d'embeddings ne fournit pas de methode de test.")
+            if not isinstance(vec, list) or len(vec) == 0:
+                raise RuntimeError("Vecteur d'embedding invalide retourne par MistralAIEmbeddings.")
+        except Exception as exc:
+            raise RuntimeError(
+                "Echec du sanity check embeddings avant RAGAS. "
+                "Verifie la configuration Mistral et les dependances."
+            ) from exc
 
         llm = LangchainLLMWrapper(llm_model)
         embeddings = LangchainEmbeddingsWrapper(embed_model)
@@ -245,10 +370,13 @@ def _resolve_ragas_models() -> tuple[Any | None, Any | None]:
         ) from exc
 
 
-def _run_ragas(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], pd.DataFrame]:
+def _run_ragas(
+    samples: list[dict[str, Any]],
+    *,
+    include_context_recall: bool,
+) -> tuple[dict[str, Any], pd.DataFrame]:
     from datasets import Dataset
 
-    evaluate, metrics = _resolve_ragas_metrics()
     payload = {
         "question": [s["question"] for s in samples],
         "answer": [s["answer"] for s in samples],
@@ -257,17 +385,20 @@ def _run_ragas(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], pd.DataFr
     }
     dataset = Dataset.from_dict(payload)
     llm, embeddings = _resolve_ragas_models()
+    evaluate, metrics = _resolve_ragas_metrics(
+        llm=llm,
+        embeddings=embeddings,
+        include_context_recall=include_context_recall,
+    )
 
-    kwargs: dict[str, Any] = {"dataset": dataset, "metrics": metrics}
-    if llm is not None:
-        kwargs["llm"] = llm
-    if embeddings is not None:
-        kwargs["embeddings"] = embeddings
-
-    try:
-        result = evaluate(**kwargs)
-    except TypeError:
-        result = evaluate(dataset=dataset, metrics=metrics)
+    result = evaluate(
+        dataset=dataset,
+        metrics=metrics,
+        llm=llm,
+        embeddings=embeddings,
+        raise_exceptions=True,
+        show_progress=False,
+    )
 
     if hasattr(result, "to_dict"):
         summary = result.to_dict()
@@ -343,8 +474,17 @@ def main() -> None:
         LOGGER.info("Execution terminee (echantillons uniquement, RAGAS ignore).")
         return
 
+    if not args.include_context_recall:
+        LOGGER.info(
+            "context_recall desactive par defaut car ground_truth semble etre une consigne et non une reponse de reference. "
+            "Utilise --include-context-recall uniquement avec des labels de verite terrain."
+        )
+
     try:
-        summary, details = _run_ragas(samples)
+        summary, details = _run_ragas(
+            samples,
+            include_context_recall=args.include_context_recall,
+        )
     except Exception as exc:
         _save_outputs(output_dir=output_dir, samples=samples, summary=None, details=None)
         LOGGER.error("Echec de l'evaluation RAGAS: %s", exc)
@@ -357,6 +497,11 @@ def main() -> None:
 
     LOGGER.info("Resume RAGAS: %s", summary)
     if not details.empty:
+        metric_cols = ["answer_relevancy", "faithfulness", "context_precision", "context_recall"]
+        metric_cols = [col for col in metric_cols if col in details.columns]
+        if metric_cols:
+            missing_ratio = details[metric_cols].isna().mean().to_dict()
+            LOGGER.info("Taux de valeurs manquantes par metrique: %s", missing_ratio)
         LOGGER.info("Nombre de lignes detaillees: %s", len(details))
 
 
