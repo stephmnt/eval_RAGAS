@@ -8,6 +8,7 @@ Schema relationnel cible:
 
 Ce script lit l'Excel principal, valide les lignes
 avec Pydantic, recrée les tables et charge les données en base.
+La table `reports` est alimentée depuis les PDF Reddit (`inputs/Reddit *.pdf`).
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from PyPDF2 import PdfReader
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from utils.config import DATABASE_DIR
@@ -25,6 +27,12 @@ from utils.config import DATABASE_DIR
 EXCEL_CANDIDATES = [
     Path("inputs/regular NBA.xlsx"),
     Path("matchs/regular+NBA.xlsx"),
+]
+PDF_GLOB_PATTERNS = [
+    "Reddit *.pdf",
+    "reddit *.pdf",
+    "Reddit*.pdf",
+    "reddit*.pdf",
 ]
 DB_PATH = Path(DATABASE_DIR) / "nba_data.db"
 
@@ -126,6 +134,27 @@ def _resolve_excel_path() -> Path:
         "Aucun fichier Excel trouve. Attendu: "
         + ", ".join(str(path) for path in EXCEL_CANDIDATES)
     )
+
+
+def _resolve_reddit_pdf_paths() -> list[Path]:
+    inputs_dir = Path("inputs")
+    if not inputs_dir.exists():
+        return []
+
+    pdf_paths: list[Path] = []
+    for pattern in PDF_GLOB_PATTERNS:
+        pdf_paths.extend(sorted(inputs_dir.glob(pattern)))
+
+    # Déduplication stable
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in pdf_paths:
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
 
 
 def _to_int(value: Any) -> int | None:
@@ -320,40 +349,76 @@ def _load_matches(excel_path: Path, players: list[PlayerRow]) -> list[MatchRow]:
     return matches
 
 
-def _load_reports(excel_path: Path) -> list[ReportRow]:
+def _load_reports() -> list[ReportRow]:
+    """Charge les reports depuis les PDF Reddit fournis dans `inputs/`."""
     reports: list[ReportRow] = []
+    pdf_paths = _resolve_reddit_pdf_paths()
 
-    analyse = pd.read_excel(excel_path, sheet_name="Analyse", header=None)
-    for idx, value in analyse.iloc[:, 0].items():
-        text = str(value).strip()
-        if not text or text.lower() == "nan":
-            continue
-        if text.lower().startswith("analyse"):
-            reports.append(
-                ReportRow(
-                    report_type="section",
-                    title=text,
-                    content=text,
-                    source_sheet="Analyse",
-                    row_order=int(idx),
+    row_order = 0
+    for pdf_path in pdf_paths:
+        file_had_text = False
+        try:
+            reader = PdfReader(str(pdf_path))
+        except Exception:
+            reader = None
+
+        if reader is not None:
+            for page_idx, page in enumerate(reader.pages, start=1):
+                try:
+                    content = (page.extract_text() or "").strip()
+                except Exception:
+                    content = ""
+                if not content:
+                    continue
+
+                file_had_text = True
+                normalized = re.sub(r"\s+", " ", content).strip()
+                reports.append(
+                    ReportRow(
+                        report_type="reddit_pdf",
+                        title=f"{pdf_path.stem} - page {page_idx}",
+                        content=normalized,
+                        source_sheet=pdf_path.name,
+                        row_order=row_order,
+                    )
                 )
-            )
+                row_order += 1
 
-    dictionary = pd.read_excel(excel_path, sheet_name="Dictionnaire des données", header=0)
-    for idx, row in dictionary.iterrows():
-        key = str(row.iloc[0]).strip()
-        description = str(row.iloc[1]).strip() if len(row) > 1 else ""
-        if not key or key.lower() == "nan" or not description or description.lower() == "nan":
+        # Fallback OCR si PDF image/scanné (cas fréquent sur les exports Reddit).
+        if file_had_text:
             continue
+        try:
+            from utils.data_loader import extract_text_from_pdf
+
+            ocr_text = (extract_text_from_pdf(str(pdf_path)) or "").strip()
+        except Exception:
+            ocr_text = ""
+        if not ocr_text:
+            page_count = len(reader.pages) if reader is not None else 1
+            for page_idx in range(1, page_count + 1):
+                reports.append(
+                    ReportRow(
+                        report_type="reddit_pdf_unreadable",
+                        title=f"{pdf_path.stem} - page {page_idx}",
+                        content="Aucun texte extractible (PDF image/scanné, OCR indisponible).",
+                        source_sheet=pdf_path.name,
+                        row_order=row_order,
+                    )
+                )
+                row_order += 1
+            continue
+
+        normalized = re.sub(r"\s+", " ", ocr_text).strip()
         reports.append(
             ReportRow(
-                report_type="data_dictionary",
-                title=key,
-                content=description,
-                source_sheet="Dictionnaire des données",
-                row_order=int(idx),
+                report_type="reddit_pdf_ocr",
+                title=f"{pdf_path.stem} - OCR complet",
+                content=normalized,
+                source_sheet=pdf_path.name,
+                row_order=row_order,
             )
         )
+        row_order += 1
 
     return reports
 
@@ -527,7 +592,7 @@ def main() -> None:
 
     players = _load_players(excel_path)
     matches = _load_matches(excel_path, players)
-    reports = _load_reports(excel_path)
+    reports = _load_reports()
 
     with sqlite3.connect(DB_PATH) as conn:
         _init_db(conn)

@@ -25,6 +25,7 @@ from typing import Any
 import pandas as pd
 from mistralai import Mistral
 
+from sql_tool import answer_question_sql_via_langchain
 from utils.config import MISTRAL_API_KEY, MODEL_NAME, SEARCH_K
 from utils.vector_store import VectorStoreManager
 
@@ -184,6 +185,34 @@ DEFAULT_QUESTIONS: list[dict[str, Any]] = [
         "question": "Entre Detroit Pistons (10292) et Cleveland Cavaliers (10180), quelle est la différence de points ?",
         "ground_truth": "La différence est de 112 points.",
         "retrieval_keywords": ["Detroit Pistons", "10292", "Cleveland Cavaliers", "10180", "112"],
+    },
+    {
+        "id": "q12",
+        "category": "hybrid",
+        "question": "Donne le nom complet de l'équipe devant entre OKC et MIA, puis l'écart de points exact.",
+        "ground_truth": "Oklahoma City Thunder est devant Miami Heat avec 52 points d'écart.",
+        "retrieval_keywords": ["OKC", "MIA", "Oklahoma City Thunder", "Miami Heat", "9880", "9828", "52"],
+    },
+    {
+        "id": "q13",
+        "category": "hybrid",
+        "question": "Entre Tyler Herro (1840) et Trae Young (1839), qui est devant et de combien ?",
+        "ground_truth": "Tyler Herro est devant Trae Young d'un point (1840 contre 1839).",
+        "retrieval_keywords": ["Tyler Herro", "1840", "Trae Young", "1839", "1"],
+    },
+    {
+        "id": "q14",
+        "category": "hybrid_noisy",
+        "question": "code BOS -> nom équipe + points totaux + nb joueurs ?",
+        "ground_truth": "BOS correspond à Boston Celtics avec 9551 points totaux et 17 joueurs.",
+        "retrieval_keywords": ["BOS", "Boston Celtics", "9551", "17"],
+    },
+    {
+        "id": "q15",
+        "category": "robustness_limit",
+        "question": "Compare les rebonds domicile vs extérieur pour MIA et donne la différence exacte.",
+        "ground_truth": "Les données domicile/extérieur ne sont pas disponibles dans le corpus fourni.",
+        "retrieval_keywords": ["MIA", "Miami Heat", "rebonds", "domicile", "extérieur"],
     },
 ]
 
@@ -471,7 +500,7 @@ def _merge_retrieval_results(
     return merged[:k]
 
 
-def _build_prompt(question: str, contexts: list[str]) -> str:
+def _build_prompt(question: str, contexts: list[str], sql_context: str) -> str:
     """Construit le prompt de génération à partir de la question et du contexte.
 
     Args:
@@ -484,10 +513,12 @@ def _build_prompt(question: str, contexts: list[str]) -> str:
     formatted_context = "\n\n".join([f"[{i + 1}] {ctx}" for i, ctx in enumerate(contexts)])
     return (
         "Réponds uniquement avec les informations présentes dans le CONTEXTE. "
+        "Quand une sortie SQL est fournie, tu peux t'en servir comme donnée structurée fiable. "
         "Si des valeurs numériques sont présentes, cite-les explicitement. "
         "Tu peux faire un calcul simple (différence, comparaison) uniquement à partir des valeurs du contexte. "
         "Si l'information est absente, réponds exactement : Information non disponible dans le contexte.\n\n"
         f"CONTEXTE:\n{formatted_context}\n\n"
+        f"SQL_CONTEXT:\n{sql_context}\n\n"
         f"QUESTION:\n{question}\n\n"
         "RÉPONSE FINALE :"
     )
@@ -498,6 +529,7 @@ def _generate_answer(
     model: str,
     question: str,
     contexts: list[str],
+    sql_context: str,
 ) -> tuple[str, dict[str, int | None]]:
     """Génère une réponse Mistral contrainte par les contexts.
 
@@ -517,7 +549,7 @@ def _generate_answer(
             {"input_tokens": None, "output_tokens": None, "total_tokens": None},
         )
 
-    prompt = _build_prompt(question=question, contexts=contexts)
+    prompt = _build_prompt(question=question, contexts=contexts, sql_context=sql_context)
     try:
         response = client.chat.complete(
             model=model,
@@ -538,6 +570,33 @@ def _generate_answer(
             f"Erreur de génération : {exc}",
             {"input_tokens": None, "output_tokens": None, "total_tokens": None},
         )
+
+
+def _build_sql_context(question: str) -> tuple[str, bool, str | None]:
+    """Construit le contexte SQL à injecter dans le prompt de génération.
+
+    Returns:
+        tuple[str, bool, str | None]: (contexte SQL, sql_utilise, sql_query)
+    """
+    try:
+        result = answer_question_sql_via_langchain(question)
+    except Exception as exc:
+        return f"Echec du tool SQL: {exc}", False, None
+
+    if result.get("status") == "no_tool":
+        return str(result.get("message", "Aucun appel SQL jugé nécessaire.")), False, None
+
+    if result.get("status") != "ok":
+        return f"Tool SQL indisponible: {result.get('message')}", False, None
+
+    sql_query = result.get("sql")
+    rows = result.get("rows", [])
+    preview_rows = rows[:10]
+    return (
+        f"SQL: {sql_query}\nRows (max 10): {preview_rows}",
+        True,
+        sql_query,
+    )
 
 
 def _build_samples(
@@ -591,9 +650,17 @@ def _build_samples(
         contexts = [_truncate_context(r.get("text", "")) for r in search_results]
         contexts = [c for c in contexts if c and len(c.strip()) > 30]
 
+        sql_context, sql_used, sql_query = _build_sql_context(row["question"])
+
         generation_start = time.perf_counter()
         _sleep_between_requests()
-        answer, usage = _generate_answer(client, model, row["question"], contexts)
+        answer, usage = _generate_answer(
+            client=client,
+            model=model,
+            question=row["question"],
+            contexts=contexts,
+            sql_context=sql_context,
+        )
         generation_latency_s = round(time.perf_counter() - generation_start, 6)
 
         total_latency_s = round(time.perf_counter() - sample_start, 6)
@@ -607,6 +674,8 @@ def _build_samples(
             "ground_truth": row["ground_truth"],
             "retrieval_keywords": row.get("retrieval_keywords", []),
             "retrieval_queries": retrieval_queries,
+            "sql_used": sql_used,
+            "sql_query": sql_query,
             "retrieval_latency_s": retrieval_latency_s,
             "generation_latency_s": generation_latency_s,
             "total_latency_s": total_latency_s,
@@ -745,6 +814,7 @@ def _build_additional_metrics_dataframe(
                 "input_tokens": sample.get("input_tokens"),
                 "output_tokens": sample.get("output_tokens"),
                 "total_tokens": sample.get("total_tokens"),
+                "sql_used": 1.0 if sample.get("sql_used") else 0.0,
                 **retrieval_metrics,
             }
         )

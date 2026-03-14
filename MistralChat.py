@@ -3,7 +3,7 @@ import streamlit as st
 import logging
 
 from mistralai import Mistral
-from sql_tool import answer_question_sql, llm_should_use_sql
+from sql_tool import answer_question_sql_via_langchain
 from utils.config import (
     MISTRAL_API_KEY, MODEL_NAME, SEARCH_K,
     APP_TITLE, NAME
@@ -157,23 +157,25 @@ if prompt := st.chat_input(f"Posez votre question sur la {NAME}..."):
         context_str = "Aucune information pertinente trouvée dans la base de connaissances pour cette question."
         logging.warning(f"Aucun contexte trouvé pour la query: {prompt}")
 
-    # 5. Si la question semble chiffrée, appeler le Tool SQL.
+    # 5. Routage SQL outillé LangChain (tool-calling end-to-end).
     sql_context_str = "Aucun appel SQL nécessaire pour cette question."
-    if llm_should_use_sql(prompt):
-        try:
-            sql_result = answer_question_sql(prompt)
-            if sql_result.get("status") == "ok":
-                sql_rows = sql_result.get("rows", [])
-                sql_context_str = (
-                    f"SQL executée: {sql_result.get('sql')}\n"
-                    f"Resultats (max 10 lignes): {sql_rows[:10]}"
-                )
-                logging.info("Tool SQL exécuté pour une question chiffrée.")
-            else:
-                sql_context_str = f"Tool SQL indisponible: {sql_result.get('message')}"
-        except Exception as e:
-            logging.exception("Erreur pendant l'appel SQL")
-            sql_context_str = f"Echec de l'appel SQL: {e}"
+    try:
+        sql_result = answer_question_sql_via_langchain(prompt)
+        status = sql_result.get("status")
+        if status == "ok":
+            sql_rows = sql_result.get("rows", [])
+            sql_context_str = (
+                f"SQL executée: {sql_result.get('sql')}\n"
+                f"Resultats (max 10 lignes): {sql_rows[:10]}"
+            )
+            logging.info("Tool SQL exécuté via flux LangChain outillé.")
+        elif status == "no_tool":
+            sql_context_str = sql_result.get("message", "Aucun appel SQL nécessaire pour cette question.")
+        else:
+            sql_context_str = f"Tool SQL indisponible: {sql_result.get('message')}"
+    except Exception as e:
+        logging.exception("Erreur pendant l'appel SQL outillé")
+        sql_context_str = f"Echec de l'appel SQL: {e}"
 
     # 6. Construire le prompt final pour l'API Mistral en utilisant RAG + SQL
     final_prompt_for_llm = SYSTEM_PROMPT.format(

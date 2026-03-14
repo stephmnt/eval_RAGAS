@@ -11,10 +11,13 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import StructuredTool
+from langchain_mistralai import ChatMistralAI
 from mistralai import Mistral
 
 from utils.config import DATABASE_DIR, MISTRAL_API_KEY, MODEL_NAME
@@ -214,6 +217,112 @@ def _get_agent() -> NBASQLTool:
 
 def answer_question_sql(question: str) -> dict[str, Any]:
     return _get_agent().answer(question)
+
+
+@lru_cache(maxsize=1)
+def _get_routing_llm() -> ChatMistralAI:
+    if not MISTRAL_API_KEY:
+        raise EnvironmentError("MISTRAL_API_KEY est requis pour le routage LangChain.")
+    try:
+        return ChatMistralAI(
+            model=MODEL_NAME,
+            temperature=0.0,
+            api_key=MISTRAL_API_KEY,
+        )
+    except TypeError:
+        return ChatMistralAI(
+            model=MODEL_NAME,
+            temperature=0.0,
+            mistral_api_key=MISTRAL_API_KEY,
+        )
+
+
+@lru_cache(maxsize=1)
+def _get_structured_sql_tool() -> StructuredTool:
+    return build_sql_tool()
+
+
+def answer_question_sql_via_langchain(question: str) -> dict[str, Any]:
+    """Route et exécute le tool SQL via un flux LangChain tool-calling.
+
+    Returns:
+        dict[str, Any]: Payload unifié contenant status/sql/rows/message.
+            status peut valoir `ok`, `no_tool` ou `error`.
+    """
+    trimmed = question.strip()
+    if not trimmed:
+        return {
+            "status": "no_tool",
+            "sql": None,
+            "rows": [],
+            "message": "Question vide, aucun appel SQL.",
+        }
+
+    # Fallback minimal si les dépendances LangChain/clé API ne sont pas disponibles.
+    if not MISTRAL_API_KEY:
+        if not is_likely_quant_question(trimmed):
+            return {
+                "status": "no_tool",
+                "sql": None,
+                "rows": [],
+                "message": "Aucun appel SQL nécessaire.",
+            }
+        return answer_question_sql(trimmed)
+
+    tool = _get_structured_sql_tool()
+    llm = _get_routing_llm().bind_tools([tool])
+    messages = [
+        SystemMessage(
+            content=(
+                "Tu réponds aux questions NBA. "
+                "Appelle l'outil `nba_sql_tool` uniquement si la question "
+                "nécessite une réponse chiffrée, une comparaison numérique, "
+                "un classement ou une agrégation."
+            )
+        ),
+        HumanMessage(content=trimmed),
+    ]
+
+    try:
+        ai_message = llm.invoke(messages)
+        tool_calls = getattr(ai_message, "tool_calls", None) or []
+
+        if not tool_calls:
+            return {
+                "status": "no_tool",
+                "sql": None,
+                "rows": [],
+                "message": "Aucun appel SQL jugé utile par le routeur outillé.",
+            }
+
+        first_call = tool_calls[0]
+        args = first_call.get("args", {})
+        raw_result = tool.invoke(args if isinstance(args, dict) else {"question": trimmed})
+
+        if isinstance(raw_result, str):
+            result = json.loads(raw_result)
+        elif isinstance(raw_result, dict):
+            result = raw_result
+        else:
+            result = {
+                "status": "error",
+                "sql": None,
+                "rows": [],
+                "message": f"Réponse tool inattendue: {type(raw_result).__name__}",
+            }
+
+        result.setdefault("status", "ok")
+        result.setdefault("sql", None)
+        result.setdefault("rows", [])
+        result.setdefault("message", "Résultats SQL disponibles.")
+        return result
+    except Exception as exc:
+        return {
+            "status": "error",
+            "sql": None,
+            "rows": [],
+            "message": f"Echec du flux LangChain SQL: {exc}",
+        }
 
 
 def build_sql_tool() -> StructuredTool:
