@@ -3,6 +3,7 @@ import streamlit as st
 import logging
 
 from mistralai import Mistral
+from sql_tool import answer_question_sql, llm_should_use_sql
 from utils.config import (
     MISTRAL_API_KEY, MODEL_NAME, SEARCH_K,
     APP_TITLE, NAME
@@ -62,6 +63,11 @@ Ta mission est de répondre aux questions des fans en animant le débat.
 
 ---
 {{context_str}}
+---
+
+DONNEES SQL (si disponibles):
+---
+{{sql_context_str}}
 ---
 
 QUESTION DU FAN:
@@ -151,8 +157,30 @@ if prompt := st.chat_input(f"Posez votre question sur la {NAME}..."):
         context_str = "Aucune information pertinente trouvée dans la base de connaissances pour cette question."
         logging.warning(f"Aucun contexte trouvé pour la query: {prompt}")
 
-    # 5. Construire le prompt final pour l'API Mistral en utilisant le System Prompt RAG
-    final_prompt_for_llm = SYSTEM_PROMPT.format(context_str=context_str, question=prompt)
+    # 5. Si la question semble chiffrée, appeler le Tool SQL.
+    sql_context_str = "Aucun appel SQL nécessaire pour cette question."
+    if llm_should_use_sql(prompt):
+        try:
+            sql_result = answer_question_sql(prompt)
+            if sql_result.get("status") == "ok":
+                sql_rows = sql_result.get("rows", [])
+                sql_context_str = (
+                    f"SQL executée: {sql_result.get('sql')}\n"
+                    f"Resultats (max 10 lignes): {sql_rows[:10]}"
+                )
+                logging.info("Tool SQL exécuté pour une question chiffrée.")
+            else:
+                sql_context_str = f"Tool SQL indisponible: {sql_result.get('message')}"
+        except Exception as e:
+            logging.exception("Erreur pendant l'appel SQL")
+            sql_context_str = f"Echec de l'appel SQL: {e}"
+
+    # 6. Construire le prompt final pour l'API Mistral en utilisant RAG + SQL
+    final_prompt_for_llm = SYSTEM_PROMPT.format(
+        context_str=context_str,
+        sql_context_str=sql_context_str,
+        question=prompt,
+    )
 
     # Créer la liste de messages pour l'API (juste le prompt système/utilisateur combiné)
     messages_for_api = [
@@ -163,7 +191,7 @@ if prompt := st.chat_input(f"Posez votre question sur la {NAME}..."):
     # === Fin de la logique RAG ===
 
 
-    # 6. Afficher indicateur + Générer la réponse de l'assistant via LLM
+    # 7. Afficher indicateur + Générer la réponse de l'assistant via LLM
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         message_placeholder.text("...") # Indicateur simple
@@ -174,7 +202,7 @@ if prompt := st.chat_input(f"Posez votre question sur la {NAME}..."):
         # Affichage de la réponse complète
         message_placeholder.write(response_content)
 
-    # 7. Ajouter la réponse de l'assistant à l'historique (pour affichage UI)
+    # 8. Ajouter la réponse de l'assistant à l'historique (pour affichage UI)
     st.session_state.messages.append({"role": "assistant", "content": response_content})
 
 # Petit pied de page optionnel
