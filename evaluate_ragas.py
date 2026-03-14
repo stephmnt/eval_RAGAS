@@ -205,18 +205,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--input-cost-per-1k-tokens",
-        type=float,
-        default=0.0,
-        help="Cout USD des tokens d'entree pour 1000 tokens (0 pour desactiver).",
-    )
-    parser.add_argument(
-        "--output-cost-per-1k-tokens",
-        type=float,
-        default=0.0,
-        help="Cout USD des tokens de sortie pour 1000 tokens (0 pour desactiver).",
-    )
-    parser.add_argument(
         "--retrieval-overlap-threshold",
         type=float,
         default=MIN_KEYWORD_MATCH_RATIO,
@@ -360,24 +348,6 @@ def _extract_usage_tokens(response: Any) -> dict[str, int | None]:
     }
 
 
-def _estimate_cost_usd(
-    *,
-    input_tokens: int | None,
-    output_tokens: int | None,
-    input_cost_per_1k_tokens: float,
-    output_cost_per_1k_tokens: float,
-) -> float | None:
-    if input_tokens is None or output_tokens is None:
-        return None
-    if input_cost_per_1k_tokens <= 0 and output_cost_per_1k_tokens <= 0:
-        return None
-    return round(
-        (input_tokens / 1000.0) * input_cost_per_1k_tokens
-        + (output_tokens / 1000.0) * output_cost_per_1k_tokens,
-        8,
-    )
-
-
 def _normalize_text_for_match(text: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
 
@@ -519,8 +489,6 @@ def _build_samples(
     model: str,
     k: int,
     min_score: float | None,
-    input_cost_per_1k_tokens: float,
-    output_cost_per_1k_tokens: float,
 ) -> list[dict[str, Any]]:
     samples: list[dict[str, Any]] = []
     for sample_index, row in enumerate(questions):
@@ -547,13 +515,6 @@ def _build_samples(
         generation_latency_s = round(time.perf_counter() - generation_start, 6)
 
         total_latency_s = round(time.perf_counter() - sample_start, 6)
-        estimated_cost_usd = _estimate_cost_usd(
-            input_tokens=usage["input_tokens"],
-            output_tokens=usage["output_tokens"],
-            input_cost_per_1k_tokens=input_cost_per_1k_tokens,
-            output_cost_per_1k_tokens=output_cost_per_1k_tokens,
-        )
-
         sample = {
             "sample_index": sample_index,
             "id": row["id"],
@@ -570,7 +531,6 @@ def _build_samples(
             "input_tokens": usage["input_tokens"],
             "output_tokens": usage["output_tokens"],
             "total_tokens": usage["total_tokens"],
-            "estimated_cost_usd": estimated_cost_usd,
         }
         samples.append(sample)
         LOGGER.info(
@@ -680,7 +640,6 @@ def _build_additional_metrics_dataframe(
                 "input_tokens": sample.get("input_tokens"),
                 "output_tokens": sample.get("output_tokens"),
                 "total_tokens": sample.get("total_tokens"),
-                "estimated_cost_usd": sample.get("estimated_cost_usd"),
                 **retrieval_metrics,
             }
         )
@@ -1021,8 +980,6 @@ def main() -> None:
         model=args.model,
         k=args.k,
         min_score=args.min_score,
-        input_cost_per_1k_tokens=args.input_cost_per_1k_tokens,
-        output_cost_per_1k_tokens=args.output_cost_per_1k_tokens,
     )
     LOGGER.info("Echantillons generes: %s", len(samples))
 
@@ -1082,7 +1039,6 @@ def main() -> None:
             "latency_retrieval_s",
             "latency_generation_s",
             "latency_total_s",
-            "estimated_cost_usd",
         ]
         metric_cols = [col for col in metric_cols if col in details.columns]
         if metric_cols:
