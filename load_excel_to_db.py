@@ -13,6 +13,7 @@ La table `reports` est alimentée depuis les PDF Reddit (`inputs/Reddit *.pdf`).
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 from pathlib import Path
@@ -23,6 +24,8 @@ from PyPDF2 import PdfReader
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from utils.config import DATABASE_FILE
+
+LOGGER = logging.getLogger(__name__)
 
 EXCEL_CANDIDATES = [
     Path("inputs/regular NBA.xlsx"),
@@ -60,15 +63,15 @@ class PlayerRow(BaseModel):
     usage_pct: float | None = None
     pie: float | None = None
 
-    @field_validator("player_name")
+    @field_validator("player_name", mode="before")
     @classmethod
     def _clean_name(cls, value: str) -> str:
-        return value.strip()
+        return str(value).strip()
 
-    @field_validator("team_code")
+    @field_validator("team_code", mode="before")
     @classmethod
     def _clean_code(cls, value: str) -> str:
-        return value.strip().upper()
+        return str(value).strip().upper()
 
 
 class MatchRow(BaseModel):
@@ -80,15 +83,15 @@ class MatchRow(BaseModel):
     team_wins: int | None = Field(default=None, ge=0)
     team_losses: int | None = Field(default=None, ge=0)
 
-    @field_validator("team_code")
+    @field_validator("team_code", mode="before")
     @classmethod
     def _normalize_team_code(cls, value: str) -> str:
-        return value.strip().upper()
+        return str(value).strip().upper()
 
-    @field_validator("team_name")
+    @field_validator("team_name", mode="before")
     @classmethod
     def _normalize_team_name(cls, value: str) -> str:
-        return value.strip()
+        return str(value).strip()
 
 
 class StatRow(BaseModel):
@@ -587,6 +590,7 @@ def _insert_reports(conn: sqlite3.Connection, reports: list[ReportRow]) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     excel_path = _resolve_excel_path()
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -603,12 +607,12 @@ def main() -> None:
         _insert_reports(conn, reports)
         conn.commit()
 
-    print(f"Excel charge: {excel_path}")
-    print(f"Base SQLite: {DB_PATH}")
-    print(f"players: {len(players)}")
-    print(f"matches: {len(matches)}")
-    print(f"stats: {stats_count}")
-    print(f"reports: {len(reports)}")
+    LOGGER.info("Excel charge: %s", excel_path)
+    LOGGER.info("Base SQLite: %s", DB_PATH)
+    LOGGER.info("players: %s", len(players))
+    LOGGER.info("matches: %s", len(matches))
+    LOGGER.info("stats: %s", stats_count)
+    LOGGER.info("reports: %s", len(reports))
 
 
 if __name__ == "__main__":

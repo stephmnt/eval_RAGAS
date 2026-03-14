@@ -16,6 +16,13 @@ if not MISTRAL_API_KEY:
 EMBEDDING_MODEL = "mistral-embed"
 MODEL_NAME = "mistral-small-latest" # Ou un autre modèle comme mistral-large-latest
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 # --- Configuration de l'Indexation ---
 # INPUT_DATA_URL = os.getenv("INPUT_DATA_URL") # Décommentez si vous utilisez une URL
 INPUT_DIR = "inputs"                # Dossier pour les données sources après extraction
@@ -35,6 +42,11 @@ DATABASE_DIR = "database"
 # Base canonique utilisée par l'ingestion Excel et le Tool SQL
 DATABASE_FILE = os.path.join(DATABASE_DIR, "nba_data.db")
 DATABASE_URL = f"sqlite:///{DATABASE_FILE}" # URL SQLAlchemy (si utilisée)
+
+# --- Observabilité (optionnelle) ---
+LOGFIRE_ENABLED = _env_bool("LOGFIRE_ENABLED", default=False)
+LOGFIRE_SEND_TO_LOGFIRE = _env_bool("LOGFIRE_SEND_TO_LOGFIRE", default=False)
+LOGFIRE_SERVICE_NAME = os.getenv("LOGFIRE_SERVICE_NAME", "rag-nba")
 
 # --- Configuration de l'Application ---
 APP_TITLE = "NBA Analyst AI"

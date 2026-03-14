@@ -28,7 +28,14 @@ from mistralai import Mistral
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from sql_tool import answer_question_sql_via_langchain
-from utils.config import MISTRAL_API_KEY, MODEL_NAME, SEARCH_K
+from utils.config import (
+    LOGFIRE_ENABLED,
+    LOGFIRE_SEND_TO_LOGFIRE,
+    LOGFIRE_SERVICE_NAME,
+    MISTRAL_API_KEY,
+    MODEL_NAME,
+    SEARCH_K,
+)
 from utils.vector_store import VectorStoreManager
 
 LOGGER = logging.getLogger(__name__)
@@ -215,9 +222,57 @@ class EvaluationSample(BaseModel):
         return normalized
 
 
+class SQLToolResultPayload(BaseModel):
+    """Schéma de validation d'une sortie du Tool SQL."""
+
+    status: str = Field(min_length=1)
+    sql: str | None = None
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    message: str | None = None
+
+    @field_validator("status")
+    @classmethod
+    def _normalize_status(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        allowed = {"ok", "no_tool", "error", "unknown"}
+        if normalized not in allowed:
+            raise ValueError(f"status SQL invalide: {value}")
+        return normalized
+
+    @model_validator(mode="after")
+    def _check_sql_consistency(self) -> "SQLToolResultPayload":
+        if self.status == "ok":
+            if not self.sql or not self.sql.strip():
+                raise ValueError("status=ok exige une requête SQL non vide.")
+        else:
+            if self.sql is not None and str(self.sql).strip():
+                raise ValueError("status!=ok ne doit pas exposer de requête SQL exploitable.")
+            if self.rows:
+                raise ValueError("status!=ok ne doit pas exposer de lignes SQL.")
+        return self
+
+
+class RagasRunOutput(BaseModel):
+    """Validation minimale de la sortie utile du pipeline d'évaluation."""
+
+    sample_count: int = Field(ge=0)
+    summary: dict[str, Any]
+    details_rows: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _check_counts(self) -> "RagasRunOutput":
+        if self.details_rows and self.sample_count and self.details_rows != self.sample_count:
+            raise ValueError("Le nombre de lignes détaillées doit correspondre au nombre d'échantillons.")
+        return self
+
+
 def _configure_logfire() -> None:
     """Initialise Pydantic Logfire en mode non bloquant."""
     global _LOGFIRE
+    if not LOGFIRE_ENABLED:
+        LOGGER.info("Logfire désactivé (LOGFIRE_ENABLED=false).")
+        _LOGFIRE = None
+        return
     try:
         import logfire
     except Exception:
@@ -227,7 +282,10 @@ def _configure_logfire() -> None:
 
     try:
         try:
-            logfire.configure(service_name="evaluate_ragas", send_to_logfire=False)
+            logfire.configure(
+                service_name=LOGFIRE_SERVICE_NAME,
+                send_to_logfire=LOGFIRE_SEND_TO_LOGFIRE,
+            )
         except TypeError:
             logfire.configure()
         try:
@@ -813,8 +871,10 @@ def _build_sql_context(question: str) -> tuple[str, bool, str | None]:
         tuple[str, bool, str | None]: (contexte SQL, sql_utilise, sql_query)
     """
     try:
-        result = answer_question_sql_via_langchain(question)
+        raw_result = answer_question_sql_via_langchain(question)
+        result = SQLToolResultPayload.model_validate(raw_result).model_dump()
     except Exception as exc:
+        _logfire_event("error", "sql_tool_validation_failed", question=question, error=str(exc))
         return f"Echec du tool SQL: {exc}", False, None
 
     if result.get("status") == "no_tool":
@@ -1407,6 +1467,14 @@ def _run_ragas(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], pd.DataFr
         "batch_size": RAGAS_BATCH_SIZE,
         "strict_ragas_errors": STRICT_RAGAS_ERRORS,
     }
+
+    RagasRunOutput.model_validate(
+        {
+            "sample_count": len(samples),
+            "summary": summary,
+            "details_rows": len(details),
+        }
+    )
 
     return summary, details
 

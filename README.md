@@ -59,6 +59,7 @@ flowchart TD
 - Python 3.9+
 - Clé API Mistral valide
 - Environnement virtuel recommandé
+- Logfire optionnel (désactivé par défaut)
 
 ## 4. Installation
 ```bash
@@ -71,7 +72,15 @@ python -m pip install -r requirements.txt
 Créer un `.env` à la racine :
 ```bash
 MISTRAL_API_KEY=your_key_here
+LOGFIRE_ENABLED=false
+LOGFIRE_SEND_TO_LOGFIRE=false
+LOGFIRE_SERVICE_NAME=rag-nba
 ```
+
+Notes Logfire :
+- `LOGFIRE_ENABLED=true` active l’instrumentation (API + pipeline d’évaluation).
+- `LOGFIRE_SEND_TO_LOGFIRE=true` envoie vers Logfire Cloud (pré-requis externe : config/token Logfire).
+- Par défaut (`false`), l’intégration reste locale et non bloquante.
 
 ## 5. Données d'entrée
 Données attendues (selon mission) :
@@ -102,9 +111,13 @@ Données attendues (selon mission) :
 ### `api.py`
 - API REST FastAPI versionnée.
 - Expose le même pipeline RAG + SQL que l'app Streamlit.
+- Validation Pydantic explicite des flux internes : contextes retrieval, résultat SQL, réponse générée, sortie API.
+- Instrumentation Logfire optionnelle.
 
 ### `evaluate_ragas.py`
 - Évaluation automatisée RAGAS (profil core).
+- Validation Pydantic explicite des flux RAG : contextes, résultat SQL, réponse, échantillon, sortie de run.
+- Instrumentation Logfire optionnelle.
 - Génère :
   - `outputs/evaluations/samples_*.json`
   - `outputs/evaluations/ragas_summary_*.json`
@@ -201,6 +214,17 @@ python -m uvicorn api:app --reload --port 8000
 python evaluate_ragas.py
 ```
 
+## 10.1 Tests rapides (sans appel réseau réel)
+```bash
+pytest -q
+```
+
+Le dossier `tests/` couvre :
+- validateurs Pydantic du flux RAG,
+- contrat principal de l’API,
+- garde-fous SQL lecture seule,
+- validation d’ingestion (modèles Pydantic).
+
 ## 10. Évaluation et rapport
 Artefacts d'évaluation : `outputs/evaluations/`
 - `samples_*.json`
@@ -213,3 +237,8 @@ Rapport d'analyse : `notes_perso.ipynb`
 - Les erreurs API Mistral (ex. 429) peuvent dégrader les scores d'évaluation.
 - Les PDF Reddit peuvent être image-only ; l'extraction texte dépend de la disponibilité OCR.
 - Les métriques automatiques RAGAS ne remplacent pas une validation humaine métier.
+
+## 12. Dépendances conservées / nettoyées
+- `streamlit-feedback` retiré : non utilisé dans le code versionné.
+- `langchain-openai` conservé : requis par la stack `ragas==0.4.3` (imports internes de compatibilité).
+- `langchain-community` conservé : composant de l’écosystème LangChain utilisé avec la version retenue.
