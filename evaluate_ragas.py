@@ -12,6 +12,7 @@ L'exécution nécessite une clé API Mistral valide ainsi que le package
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -24,6 +25,7 @@ from typing import Any
 
 import pandas as pd
 from mistralai import Mistral
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from sql_tool import answer_question_sql_via_langchain
 from utils.config import MISTRAL_API_KEY, MODEL_NAME, SEARCH_K
@@ -106,6 +108,230 @@ RAGAS_BATCH_SIZE = 1
 STRICT_RAGAS_ERRORS = False
 # Délai anti-429 entre appels réseau (embeddings/chat). À ajuster selon les limites de l'API Mistral et la taille du jeu de données, en l'état 0.25 fonctionne.
 REQUEST_DELAY_SECONDS = 0.25
+
+_LOGFIRE: Any | None = None
+
+
+class RetrievedContext(BaseModel):
+    """Schéma de validation d'un contexte retourné par le retriever."""
+
+    text: str = Field(min_length=1)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    score: float = 0.0
+
+    @field_validator("text")
+    @classmethod
+    def _normalize_text(cls, value: str) -> str:
+        cleaned = str(value).strip()
+        if not cleaned:
+            raise ValueError("Le champ `text` du contexte est vide.")
+        return cleaned
+
+    @field_validator("score", mode="before")
+    @classmethod
+    def _coerce_score(cls, value: Any) -> float:
+        if value is None:
+            return 0.0
+        try:
+            return float(value)
+        except Exception as exc:
+            raise ValueError("Le champ `score` doit être numérique.") from exc
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def _normalize_metadata(cls, value: Any) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return value
+        raise ValueError("Le champ `metadata` doit être un objet clé/valeur.")
+
+
+class GeneratedAnswerPayload(BaseModel):
+    """Schéma de validation d'une réponse générée + tokens."""
+
+    answer: str = Field(min_length=1)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+
+    @field_validator("answer")
+    @classmethod
+    def _normalize_answer(cls, value: str) -> str:
+        cleaned = str(value).strip()
+        if not cleaned:
+            raise ValueError("La réponse générée est vide.")
+        return cleaned
+
+    @model_validator(mode="after")
+    def _check_total_tokens(self) -> "GeneratedAnswerPayload":
+        if (
+            self.total_tokens is not None
+            and self.input_tokens is not None
+            and self.output_tokens is not None
+            and self.total_tokens < (self.input_tokens + self.output_tokens)
+        ):
+            raise ValueError("`total_tokens` est incohérent avec input/output tokens.")
+        return self
+
+
+class EvaluationSample(BaseModel):
+    """Schéma de validation d'un échantillon complet évalué par RAGAS."""
+
+    sample_index: int = Field(ge=0)
+    id: str = Field(min_length=1)
+    category: str = Field(min_length=1)
+    question: str = Field(min_length=1)
+    answer: str = Field(min_length=1)
+    contexts: list[str] = Field(default_factory=list)
+    ground_truth: str = Field(min_length=1)
+    retrieval_keywords: list[str] = Field(default_factory=list)
+    retrieval_queries: list[str] = Field(default_factory=list)
+    sql_used: bool
+    sql_query: str | None = None
+    retrieval_latency_s: float = Field(ge=0.0)
+    generation_latency_s: float = Field(ge=0.0)
+    total_latency_s: float = Field(ge=0.0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+
+    @field_validator("id", "category", "question", "answer", "ground_truth")
+    @classmethod
+    def _normalize_required_text(cls, value: str) -> str:
+        cleaned = str(value).strip()
+        if not cleaned:
+            raise ValueError("Champ textuel obligatoire vide.")
+        return cleaned
+
+    @field_validator("contexts", mode="before")
+    @classmethod
+    def _normalize_contexts(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("`contexts` doit être une liste de chaînes.")
+        normalized = [str(item).strip() for item in value if str(item).strip()]
+        return normalized
+
+
+def _configure_logfire() -> None:
+    """Initialise Pydantic Logfire en mode non bloquant."""
+    global _LOGFIRE
+    try:
+        import logfire
+    except Exception:
+        LOGGER.info("Pydantic Logfire non installé : instrumentation désactivée.")
+        _LOGFIRE = None
+        return
+
+    try:
+        try:
+            logfire.configure(service_name="evaluate_ragas", send_to_logfire=False)
+        except TypeError:
+            logfire.configure()
+        try:
+            logfire.instrument_pydantic()
+        except Exception:
+            LOGGER.warning("Logfire actif, mais instrument_pydantic a échoué.")
+        _LOGFIRE = logfire
+        LOGGER.info("Pydantic Logfire activé.")
+    except Exception as exc:
+        LOGGER.warning("Impossible d'initialiser Logfire : %s", exc)
+        _LOGFIRE = None
+
+
+def _logfire_span(name: str, **attrs: Any) -> contextlib.AbstractContextManager[Any]:
+    """Retourne un span Logfire si disponible, sinon un no-op context."""
+    if _LOGFIRE is None:
+        return contextlib.nullcontext()
+    try:
+        return _LOGFIRE.span(name, **attrs)
+    except Exception:
+        return contextlib.nullcontext()
+
+
+def _logfire_event(level: str, message: str, **attrs: Any) -> None:
+    """Émet un événement Logfire si l'intégration est active."""
+    if _LOGFIRE is None:
+        return
+    try:
+        log_method = getattr(_LOGFIRE, level, None)
+        if callable(log_method):
+            log_method(message, **attrs)
+    except Exception:
+        return
+
+
+def _validate_retrieved_contexts(
+    raw_contexts: list[dict[str, Any]],
+    *,
+    sample_id: str,
+    retrieval_query: str,
+) -> list[dict[str, Any]]:
+    """Valide explicitement la structure des contextes retournés par retrieval."""
+    validated: list[dict[str, Any]] = []
+    for idx, context in enumerate(raw_contexts):
+        try:
+            parsed = RetrievedContext.model_validate(context)
+            validated.append(parsed.model_dump())
+        except ValidationError as exc:
+            LOGGER.warning(
+                "Contexte invalide ignoré (sample=%s, query=%s, index=%s): %s",
+                sample_id,
+                retrieval_query,
+                idx,
+                exc.errors(),
+            )
+            _logfire_event(
+                "warning",
+                "retrieved_context_validation_failed",
+                sample_id=sample_id,
+                retrieval_query=retrieval_query,
+                context_index=idx,
+                errors=exc.errors(),
+            )
+    return validated
+
+
+def _validate_generated_answer(
+    *,
+    answer: str,
+    usage: dict[str, int | None],
+    sample_id: str,
+) -> tuple[str, dict[str, int | None]]:
+    """Valide explicitement la réponse générée et ses compteurs de tokens."""
+    payload = {
+        "answer": answer,
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+    }
+    validated = GeneratedAnswerPayload.model_validate(payload)
+    _logfire_event(
+        "info",
+        "generated_answer_validated",
+        sample_id=sample_id,
+        answer_length=len(validated.answer),
+    )
+    return validated.answer, {
+        "input_tokens": validated.input_tokens,
+        "output_tokens": validated.output_tokens,
+        "total_tokens": validated.total_tokens,
+    }
+
+
+def _validate_sample(sample: dict[str, Any]) -> dict[str, Any]:
+    """Valide explicitement un échantillon d'évaluation complet."""
+    validated = EvaluationSample.model_validate(sample)
+    _logfire_event(
+        "info",
+        "evaluation_sample_validated",
+        sample_id=validated.id,
+        category=validated.category,
+        contexts_count=len(validated.contexts),
+    )
+    return validated.model_dump()
 
 
 DEFAULT_QUESTIONS: list[dict[str, Any]] = [
@@ -523,6 +749,7 @@ def _generate_answer(
     question: str,
     contexts: list[str],
     sql_context: str,
+    sample_id: str,
 ) -> tuple[str, dict[str, int | None]]:
     """Génère une réponse Mistral contrainte par les contexts.
 
@@ -531,6 +758,7 @@ def _generate_answer(
         model: Le nom du modèle à utiliser.
         question: La question à traiter.
         contexts: Les contexts transmis au modèle.
+        sample_id: L'identifiant de l'échantillon évalué.
 
     Returns:
         tuple[str, dict[str, int | None]]: La réponse produite et les
@@ -544,21 +772,34 @@ def _generate_answer(
 
     prompt = _build_prompt(question=question, contexts=contexts, sql_context=sql_context)
     try:
-        response = client.chat.complete(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Tu es un assistant NBA. Utilise uniquement le contexte fourni et évite toute hallucination.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-        )
-        answer = response.choices[0].message.content.strip()
-        return answer, _extract_usage_tokens(response)
+        with _logfire_span("generate_answer", sample_id=sample_id, model=model):
+            response = client.chat.complete(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Tu es un assistant NBA. Utilise uniquement le contexte fourni et évite toute hallucination.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+            )
+            answer = response.choices[0].message.content.strip()
+            usage = _extract_usage_tokens(response)
+            return _validate_generated_answer(
+                answer=answer,
+                usage=usage,
+                sample_id=sample_id,
+            )
     except Exception as exc:
         LOGGER.exception("Échec de génération pour la question : %s", question)
+        _logfire_event(
+            "error",
+            "generate_answer_failed",
+            sample_id=sample_id,
+            question=question,
+            error=str(exc),
+        )
         return (
             f"Erreur de génération : {exc}",
             {"input_tokens": None, "output_tokens": None, "total_tokens": None},
@@ -624,59 +865,68 @@ def _build_samples(
     """
     samples: list[dict[str, Any]] = []
     for sample_index, row in enumerate(questions):
-        sample_start = time.perf_counter()
+        with _logfire_span("build_sample", sample_id=row["id"], category=row["category"]):
+            sample_start = time.perf_counter()
 
-        retrieval_start = time.perf_counter()
-        retrieval_queries = _build_retrieval_queries(
-            question=row["question"],
-            retrieval_keywords=list(row.get("retrieval_keywords", [])),
-        )
-        retrieval_batches: list[list[dict[str, Any]]] = []
-        for query in retrieval_queries:
+            retrieval_start = time.perf_counter()
+            retrieval_queries = _build_retrieval_queries(
+                question=row["question"],
+                retrieval_keywords=list(row.get("retrieval_keywords", [])),
+            )
+            retrieval_batches: list[list[dict[str, Any]]] = []
+            for query in retrieval_queries:
+                _sleep_between_requests()
+                batch = retriever.search(query, k=k, min_score=min_score)
+                if batch:
+                    validated_batch = _validate_retrieved_contexts(
+                        batch,
+                        sample_id=row["id"],
+                        retrieval_query=query,
+                    )
+                    if validated_batch:
+                        retrieval_batches.append(validated_batch)
+            search_results = _merge_retrieval_results(retrieval_batches, k=k)
+            retrieval_latency_s = round(time.perf_counter() - retrieval_start, 6)
+
+            contexts = [_truncate_context(r.get("text", "")) for r in search_results]
+            contexts = [c for c in contexts if c and len(c.strip()) > 30]
+
+            sql_context, sql_used, sql_query = _build_sql_context(row["question"])
+
+            generation_start = time.perf_counter()
             _sleep_between_requests()
-            batch = retriever.search(query, k=k, min_score=min_score)
-            if batch:
-                retrieval_batches.append(batch)
-        search_results = _merge_retrieval_results(retrieval_batches, k=k)
-        retrieval_latency_s = round(time.perf_counter() - retrieval_start, 6)
+            answer, usage = _generate_answer(
+                client=client,
+                model=model,
+                question=row["question"],
+                contexts=contexts,
+                sql_context=sql_context,
+                sample_id=row["id"],
+            )
+            generation_latency_s = round(time.perf_counter() - generation_start, 6)
 
-        contexts = [_truncate_context(r.get("text", "")) for r in search_results]
-        contexts = [c for c in contexts if c and len(c.strip()) > 30]
-
-        sql_context, sql_used, sql_query = _build_sql_context(row["question"])
-
-        generation_start = time.perf_counter()
-        _sleep_between_requests()
-        answer, usage = _generate_answer(
-            client=client,
-            model=model,
-            question=row["question"],
-            contexts=contexts,
-            sql_context=sql_context,
-        )
-        generation_latency_s = round(time.perf_counter() - generation_start, 6)
-
-        total_latency_s = round(time.perf_counter() - sample_start, 6)
-        sample = {
-            "sample_index": sample_index,
-            "id": row["id"],
-            "category": row["category"],
-            "question": row["question"],
-            "answer": answer,
-            "contexts": contexts,
-            "ground_truth": row["ground_truth"],
-            "retrieval_keywords": row.get("retrieval_keywords", []),
-            "retrieval_queries": retrieval_queries,
-            "sql_used": sql_used,
-            "sql_query": sql_query,
-            "retrieval_latency_s": retrieval_latency_s,
-            "generation_latency_s": generation_latency_s,
-            "total_latency_s": total_latency_s,
-            "input_tokens": usage["input_tokens"],
-            "output_tokens": usage["output_tokens"],
-            "total_tokens": usage["total_tokens"],
-        }
-        samples.append(sample)
+            total_latency_s = round(time.perf_counter() - sample_start, 6)
+            sample = {
+                "sample_index": sample_index,
+                "id": row["id"],
+                "category": row["category"],
+                "question": row["question"],
+                "answer": answer,
+                "contexts": contexts,
+                "ground_truth": row["ground_truth"],
+                "retrieval_keywords": row.get("retrieval_keywords", []),
+                "retrieval_queries": retrieval_queries,
+                "sql_used": sql_used,
+                "sql_query": sql_query,
+                "retrieval_latency_s": retrieval_latency_s,
+                "generation_latency_s": generation_latency_s,
+                "total_latency_s": total_latency_s,
+                "input_tokens": usage["input_tokens"],
+                "output_tokens": usage["output_tokens"],
+                "total_tokens": usage["total_tokens"],
+            }
+            sample = _validate_sample(sample)
+            samples.append(sample)
         LOGGER.info(
             "Échantillon généré %s (%s) - requêtes retrieval=%s, contexts=%s",
             sample["id"],
@@ -1086,16 +1336,17 @@ def _run_ragas(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], pd.DataFr
         max_workers=RAGAS_MAX_WORKERS,
     )
 
-    result = evaluate(
-        dataset=dataset,
-        metrics=metrics,
-        llm=llm,
-        embeddings=embeddings,
-        run_config=run_config,
-        batch_size=RAGAS_BATCH_SIZE,
-        raise_exceptions=STRICT_RAGAS_ERRORS,
-        show_progress=False,
-    )
+    with _logfire_span("run_ragas", samples_count=len(samples), metrics=activated_ragas_metric_names):
+        result = evaluate(
+            dataset=dataset,
+            metrics=metrics,
+            llm=llm,
+            embeddings=embeddings,
+            run_config=run_config,
+            batch_size=RAGAS_BATCH_SIZE,
+            raise_exceptions=STRICT_RAGAS_ERRORS,
+            show_progress=False,
+        )
 
     if hasattr(result, "to_dict"):
         summary = result.to_dict()
@@ -1201,6 +1452,7 @@ def main() -> None:
         RuntimeError: Si l'index vectoriel est absent ou si l'évaluation échoue.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    _configure_logfire()
 
     if not MISTRAL_API_KEY:
         raise EnvironmentError("MISTRAL_API_KEY est absent du fichier .env")
