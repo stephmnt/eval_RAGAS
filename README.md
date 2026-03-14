@@ -6,6 +6,7 @@ Ce projet implémente un assistant virtuel basé sur le modèle Mistral, utilisa
 
 - 🔍 **Recherche sémantique** avec FAISS pour trouver les documents pertinents
 - 🤖 **Génération de réponses** avec les modèles Mistral (Small ou Large)
+- 🌐 **API REST** (FastAPI) pour exposer le pipeline RAG + SQL
 - ⚙️ **Paramètres personnalisables** (modèle, nombre de documents, score minimum)
 
 ## Prérequis
@@ -53,8 +54,10 @@ MISTRAL_API_KEY=votre_clé_api_mistral
 
 ```text
 .
+├── api.py                  # API REST FastAPI (RAG + SQL)
 ├── MistralChat.py          # Application Streamlit principale
 ├── indexer.py              # Script pour indexer les documents
+├── sql_tool.py             # Tool SQL LangChain
 ├── inputs/                 # Dossier pour les documents sources
 ├── vector_db/              # Dossier pour l'index FAISS et les chunks
 ├── database/               # Base de données SQLite pour les interactions
@@ -117,6 +120,25 @@ Vérification rapide:
 ```bash
 which python
 python -m pip show mistralai
+```
+
+### 4. Exposer l'API REST
+
+```bash
+python -m uvicorn api:app --reload --port 8000
+```
+
+Endpoints:
+
+- `GET /health`
+- `POST /ask`
+
+Exemple:
+
+```bash
+curl -X POST "http://localhost:8000/ask" \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Entre OKC et MIA, quelle équipe a le plus de points totaux ?","k":5}'
 ```
 
 ## Modules principaux
