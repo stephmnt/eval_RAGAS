@@ -22,7 +22,7 @@ import pandas as pd
 from PyPDF2 import PdfReader
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from utils.config import DATABASE_DIR
+from utils.config import DATABASE_FILE
 
 EXCEL_CANDIDATES = [
     Path("inputs/regular NBA.xlsx"),
@@ -34,7 +34,7 @@ PDF_GLOB_PATTERNS = [
     "Reddit*.pdf",
     "reddit*.pdf",
 ]
-DB_PATH = Path(DATABASE_DIR) / "nba_data.db"
+DB_PATH = Path(DATABASE_FILE)
 
 
 class PlayerRow(BaseModel):

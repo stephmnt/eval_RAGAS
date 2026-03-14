@@ -20,9 +20,9 @@ from langchain_core.tools import StructuredTool
 from langchain_mistralai import ChatMistralAI
 from mistralai import Mistral
 
-from utils.config import DATABASE_DIR, MISTRAL_API_KEY, MODEL_NAME
+from utils.config import DATABASE_FILE, MISTRAL_API_KEY, MODEL_NAME
 
-DB_PATH = Path(DATABASE_DIR) / "nba_data.db"
+DB_PATH = Path(DATABASE_FILE)
 MAX_ROWS = 30
 
 SQL_FEW_SHOTS = """

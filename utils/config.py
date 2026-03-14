@@ -32,8 +32,9 @@ SEARCH_K = 5                        # Nombre de documents à récupérer par dé
 
 # --- Configuration de la Base de Données ---
 DATABASE_DIR = "database"
-DATABASE_FILE = os.path.join(DATABASE_DIR, "interactions.db")
-DATABASE_URL = f"sqlite:///{DATABASE_FILE}" # URL pour SQLAlchemy
+# Base canonique utilisée par l'ingestion Excel et le Tool SQL
+DATABASE_FILE = os.path.join(DATABASE_DIR, "nba_data.db")
+DATABASE_URL = f"sqlite:///{DATABASE_FILE}" # URL SQLAlchemy (si utilisée)
 
 # --- Configuration de l'Application ---
 APP_TITLE = "NBA Analyst AI"

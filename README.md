@@ -1,177 +1,215 @@
-# Assistant RAG avec Mistral
+# Rapport technique - système RAG NBA (Mistral + FAISS + SQL)
 
-Ce projet implémente un assistant virtuel basé sur le modèle Mistral, utilisant la technique de Retrieval-Augmented Generation (RAG) pour fournir des réponses précises et contextuelles à partir d'une base de connaissances personnalisée.
+Ce dépôt contient le prototype RAG demandé dans la mission, avec :
+- un assistant Streamlit,
+- une API REST versionnée,
+- un pipeline d'ingestion Excel vers SQLite,
+- un Tool SQL LangChain,
+- un script d'évaluation RAGAS,
+- un notebook de rapport d'évaluation.
 
-## Fonctionnalités
+## 1. État réel du repo et livrables
+Ce README reflète le dépôt réel (pas de modules fantômes).
 
-- 🔍 **Recherche sémantique** avec FAISS pour trouver les documents pertinents
-- 🤖 **Génération de réponses** avec les modèles Mistral (Small ou Large)
-- 🌐 **API REST** (FastAPI) pour exposer le pipeline RAG + SQL
-- ⚙️ **Paramètres personnalisables** (modèle, nombre de documents, score minimum)
+Modules **présents** :
+- `MistralChat.py`
+- `api.py`
+- `indexer.py`
+- `load_excel_to_db.py`
+- `sql_tool.py`
+- `evaluate_ragas.py`
+- `notes_perso.ipynb`
+- `utils/config.py`, `utils/vector_store.py`, `utils/data_loader.py`
 
-## Prérequis
+Modules **absents** (et donc non documentés comme actifs) :
+- `utils/database.py`
+- `utils/query_classifier.py`
 
+## 2. Schéma d'architecture
+```mermaid
+flowchart TD
+    U[Utilisateur] -->|Question| S[Streamlit MistralChat.py]
+    U -->|HTTP JSON| A[FastAPI api.py]
+
+    S --> R[Retriever FAISS utils/vector_store.py]
+    A --> R
+
+    S --> T[Tool SQL sql_tool.py]
+    A --> T
+
+    R --> V[(vector_db/faiss_index.idx + document_chunks.pkl)]
+    T --> D[(database/nba_data.db)]
+
+    S --> M[Mistral API]
+    A --> M
+    T --> M
+
+    I[indexer.py] --> V
+    L[load_excel_to_db.py] --> D
+
+    E[evaluate_ragas.py] --> R
+    E --> T
+    E --> M
+    E --> O[(outputs/evaluations)]
+
+    N[notes_perso.ipynb] --> O
+```
+
+## 3. Prérequis
 - Python 3.9+
-- Clé API Mistral (obtenue sur [console.mistral.ai](https://console.mistral.ai/))
+- Clé API Mistral valide
+- Environnement virtuel recommandé
 
-## Installation
-
-### 1. Cloner le dépôt
-
+## 4. Installation
 ```bash
-git clone <url-du-repo>
-cd <nom-du-repo>
-```
-
-### 2. Créer un environnement virtuel
-
-```bash
-# Création de l'environnement virtuel
 python -m venv .venv
-
-# Activation de l'environnement virtuel
-# Sur Windows
-.venv\Scripts\activate
-# Sur macOS/Linux
 source .venv/bin/activate
-```
-
-### 3. Installer les dépendances
-
-```bash
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-### 4. Configurer la clé API
-
-Créez un fichier `.env` à la racine du projet avec le contenu suivant :
-
-```python
-MISTRAL_API_KEY=votre_clé_api_mistral
-```
-
-## Structure du projet
-
-```text
-.
-├── api.py                  # API REST FastAPI (RAG + SQL)
-├── MistralChat.py          # Application Streamlit principale
-├── indexer.py              # Script pour indexer les documents
-├── sql_tool.py             # Tool SQL LangChain
-├── inputs/                 # Dossier pour les documents sources
-├── vector_db/              # Dossier pour l'index FAISS et les chunks
-├── database/               # Base de données SQLite pour les interactions
-└── utils/                  # Modules utilitaires
-    ├── config.py           # Configuration de l'application
-    ├── database.py         # Gestion de la base de données
-    └── vector_store.py     # Gestion de l'index vectoriel
-```
-
-## Utilisation
-
-### 1. Ajouter des documents
-
-Placez vos documents dans le dossier `inputs/`. Les formats supportés sont :
-
-- PDF
-- TXT
-- DOCX
-- CSV
-- JSON
-
-Vous pouvez organiser vos documents dans des sous-dossiers pour une meilleure organisation.
-
-### 2. Indexer les documents
-
-Exécutez le script d'indexation pour traiter les documents et créer l'index FAISS :
-
+Créer un `.env` à la racine :
 ```bash
-python indexer.py
+MISTRAL_API_KEY=your_key_here
 ```
 
-Ce script va :
+## 5. Données d'entrée
+Données attendues (selon mission) :
+- Excel : `inputs/regular NBA.xlsx` (ou `matchs/regular+NBA.xlsx`)
+- PDFs Reddit : `inputs/Reddit 1.pdf` ... `inputs/Reddit 4.pdf`
 
-1. Charger les documents depuis le dossier `inputs/`
-2. Découper les documents en chunks
-3. Générer des embeddings avec Mistral
-4. Créer un index FAISS pour la recherche sémantique
-5. Sauvegarder l'index et les chunks dans le dossier `vector_db/`
+## 6. Scripts livrés et rôle
+### `indexer.py`
+- Construit l'index vectoriel FAISS à partir des documents du dossier `inputs/`.
+- Produit `vector_db/faiss_index.idx` + `vector_db/document_chunks.pkl`.
 
-### 3. Lancer l'application
+### `load_excel_to_db.py`
+- Lit l'Excel NBA.
+- Valide les lignes avec Pydantic.
+- Alimente SQLite : `players`, `matches`, `stats`.
+- Alimente `reports` à partir des PDFs Reddit (texte extractible ou fallback explicite si non extractible).
 
-```bash
-python -m streamlit run MistralChat.py
-```
+### `sql_tool.py`
+- Tool SQL LangChain (`StructuredTool`).
+- Génération SQL dynamique (few-shot + schéma DB).
+- Exécution SQL en lecture seule.
+- Routage outillé via `answer_question_sql_via_langchain`.
 
-L'application sera accessible à l'adresse [http://localhost:8501](http://localhost:8501) dans votre navigateur.
+### `MistralChat.py`
+- Interface Streamlit.
+- Pipeline RAG + SQL pour répondre aux questions utilisateurs.
 
-### Dépannage: `ModuleNotFoundError: No module named 'mistralai'`
+### `api.py`
+- API REST FastAPI versionnée.
+- Expose le même pipeline RAG + SQL que l'app Streamlit.
 
-Cette erreur vient presque toujours d'un `streamlit` lancé hors de la venv.
+### `evaluate_ragas.py`
+- Évaluation automatisée RAGAS (profil core).
+- Génère :
+  - `outputs/evaluations/samples_*.json`
+  - `outputs/evaluations/ragas_summary_*.json`
+  - `outputs/evaluations/ragas_details_*.csv`
 
-```bash
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python -m streamlit run MistralChat.py
-```
+### `notes_perso.ipynb`
+- Rapport d'analyse méthodologique.
+- Inclut comparatifs avant/après et visualisations.
 
-Vérification rapide:
+## 7. Usage de la base SQLite
+Fichier DB : `database/nba_data.db`
 
-```bash
-which python
-python -m pip show mistralai
-```
+Tables principales :
+- `players`: stats agrégées joueur (points, % tirs, rebonds, etc.)
+- `matches`: agrégats équipe (code, nom, points totaux, bilan)
+- `stats`: métriques normalisées par clé (`stat_key`, `stat_value`)
+- `reports`: contenu textuel Reddit (ou marqueur explicite si PDF non extractible)
 
-### 4. Exposer l'API REST
+Flux d'écriture/lecture :
+- **Écriture**: `load_excel_to_db.py`
+- **Lecture SQL**: `sql_tool.py`
+- **Lecture indirecte dans les réponses**: `MistralChat.py`, `api.py`, `evaluate_ragas.py`
 
+## 8. API REST versionnée
+Lancer l'API :
 ```bash
 python -m uvicorn api:app --reload --port 8000
 ```
 
-Endpoints:
+Docs OpenAPI :
+- `http://localhost:8000/docs`
+- `http://localhost:8000/redoc`
 
+### Endpoints v1 (cibles)
+- `GET /api/v1/health`
+- `POST /api/v1/ask`
+
+### Endpoints legacy (compatibilité, dépréciés)
 - `GET /health`
 - `POST /ask`
 
-Exemple:
+### Format requête `/api/v1/ask`
+```json
+{
+  "question": "Entre OKC et MIA, quelle équipe a le plus de points totaux ?",
+  "k": 5
+}
+```
 
+### Format réponse `/api/v1/ask`
+```json
+{
+  "question": "...",
+  "answer": "...",
+  "retrieval_count": 5,
+  "contexts": [
+    {
+      "text": "...",
+      "score": 0.0,
+      "metadata": {"source": "..."}
+    }
+  ],
+  "sql_status": "ok",
+  "sql_query": "SELECT ...",
+  "sql_rows": [{"team_code": "OKC", "team_points_total": 9880}],
+  "latency_retrieval_s": 0.12,
+  "latency_generation_s": 0.45,
+  "latency_total_s": 0.72
+}
+```
+
+### Exemple `curl`
 ```bash
-curl -X POST "http://localhost:8000/ask" \
+curl -X POST "http://localhost:8000/api/v1/ask" \
   -H "Content-Type: application/json" \
   -d '{"question":"Entre OKC et MIA, quelle équipe a le plus de points totaux ?","k":5}'
 ```
 
-## Modules principaux
+## 9. Exécution de bout en bout
+```bash
+# 1) Construire l'index vectoriel
+python indexer.py
 
-### `utils/vector_store.py`
+# 2) Charger la base SQL
+python load_excel_to_db.py
 
-Gère l'index vectoriel FAISS et la recherche sémantique :
+# 3) Lancer l'interface Streamlit
+python -m streamlit run MistralChat.py
 
-- Chargement et découpage des documents
-- Génération des embeddings avec Mistral
-- Création et interrogation de l'index FAISS
+# 4) Lancer l'API REST
+python -m uvicorn api:app --reload --port 8000
 
-### `utils/query_classifier.py`
+# 5) Lancer l'évaluation
+python evaluate_ragas.py
+```
 
-Détermine si une requête nécessite une recherche RAG :
+## 10. Évaluation et rapport
+Artefacts d'évaluation : `outputs/evaluations/`
+- `samples_*.json`
+- `ragas_summary_*.json`
+- `ragas_details_*.csv`
 
-- Analyse des mots-clés
-- Classification avec le modèle Mistral
-- Détection des questions spécifiques vs générales
+Rapport d'analyse : `notes_perso.ipynb`
 
-### `utils/database.py`
-
-Gère la base de données SQLite pour les interactions :
-
-- Enregistrement des questions et réponses
-- Stockage des feedbacks utilisateurs
-- Récupération des statistiques
-
-## Personnalisation
-
-Vous pouvez personnaliser l'application en modifiant les paramètres dans `utils/config.py` :
-
-- Modèles Mistral utilisés
-- Taille des chunks et chevauchement
-- Nombre de documents par défaut
-- Nom de la commune ou organisation
+## 11. Limites connues
+- Les erreurs API Mistral (ex. 429) peuvent dégrader les scores d'évaluation.
+- Les PDF Reddit peuvent être image-only ; l'extraction texte dépend de la disponibilité OCR.
+- Les métriques automatiques RAGAS ne remplacent pas une validation humaine métier.
