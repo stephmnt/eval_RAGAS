@@ -20,10 +20,9 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from PyPDF2 import PdfReader
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from utils.config import DATABASE_FILE
+from utils.config import get_settings
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,7 +36,7 @@ PDF_GLOB_PATTERNS = [
     "Reddit*.pdf",
     "reddit*.pdf",
 ]
-DB_PATH = Path(DATABASE_FILE)
+DB_PATH = Path(get_settings().database_file)
 
 
 class PlayerRow(BaseModel):
@@ -354,16 +353,24 @@ def _load_matches(excel_path: Path, players: list[PlayerRow]) -> list[MatchRow]:
 
 def _load_reports() -> list[ReportRow]:
     """Charge les reports depuis les PDF Reddit fournis dans `inputs/`."""
+    try:
+        from PyPDF2 import PdfReader
+    except Exception:
+        PdfReader = None
+
     reports: list[ReportRow] = []
     pdf_paths = _resolve_reddit_pdf_paths()
 
     row_order = 0
     for pdf_path in pdf_paths:
         file_had_text = False
-        try:
-            reader = PdfReader(str(pdf_path))
-        except Exception:
+        if PdfReader is None:
             reader = None
+        else:
+            try:
+                reader = PdfReader(str(pdf_path))
+            except Exception:
+                reader = None
 
         if reader is not None:
             for page_idx, page in enumerate(reader.pages, start=1):

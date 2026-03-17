@@ -1,18 +1,15 @@
-"""Évalue le prototype RAG actuel avec RAGAS.
+"""Evaluation RAG minimale en mode core (RAGAS + métriques retrieval).
 
-Ce script construit des échantillons question-réponse à partir du Vector Store,
-puis calcule des métriques RAGAS et des métriques de retrieval
-complémentaires. Il est conçu pour être exécuté après l'indexation des
-données, avec une configuration minimale directement intégrée dans le fichier.
-
-L'exécution nécessite une clé API Mistral valide ainsi que le package
-`langchain-mistralai` pour l'intégration avec RAGAS.
+Ce script:
+1. génère des échantillons (question, contextes, réponse, métadonnées),
+2. exécute RAGAS en profil core,
+3. calcule des métriques retrieval/latence/tokens,
+4. sauvegarde les artefacts JSON/CSV.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import math
@@ -25,22 +22,38 @@ from typing import Any
 
 import pandas as pd
 from mistralai import Mistral
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from sql_tool import answer_question_sql_via_langchain
 from utils.config import (
-    LOGFIRE_ENABLED,
-    LOGFIRE_SEND_TO_LOGFIRE,
-    LOGFIRE_SERVICE_NAME,
-    MISTRAL_API_KEY,
-    MODEL_NAME,
-    SEARCH_K,
+    EvaluationSample,
+    GeneratedAnswerUsage,
+    RagasRunOutput,
+    RetrievedContext,
+    SQLToolResult,
+    configure_logfire,
+    get_settings,
+    logfire_event,
+    logfire_span,
 )
 from utils.vector_store import VectorStoreManager
 
 LOGGER = logging.getLogger(__name__)
+SETTINGS = get_settings()
 
-MIN_KEYWORD_MATCH_RATIO = 0.2
+OUTPUT_DIR = Path("outputs/evaluations")
+EVAL_K = SETTINGS.search_k
+EVAL_MIN_SCORE: float | None = None
+INCLUDE_CONTEXT_RECALL = True
+
+REQUEST_DELAY_SECONDS = 1
+RETRIEVAL_OVERLAP_THRESHOLD = 0.2
+RAGAS_TIMEOUT_SECONDS = 240
+RAGAS_MAX_RETRIES = 12
+RAGAS_MAX_WAIT_SECONDS = 120
+RAGAS_MAX_WORKERS = 1
+RAGAS_BATCH_SIZE = 1
+STRICT_RAGAS_ERRORS = False
+
 FRENCH_STOPWORDS = {
     "a",
     "au",
@@ -99,298 +112,6 @@ FRENCH_STOPWORDS = {
     "votre",
     "vous",
 }
-
-OUTPUT_DIR = "outputs/evaluations"
-EVAL_K = SEARCH_K
-EVAL_MIN_SCORE: float | None = None
-EVAL_MODEL = MODEL_NAME
-SKIP_RAGAS = False
-INCLUDE_CONTEXT_RECALL = True
-RETRIEVAL_OVERLAP_THRESHOLD = MIN_KEYWORD_MATCH_RATIO
-RAGAS_MAX_WORKERS = 1
-RAGAS_MAX_RETRIES = 12
-RAGAS_MAX_WAIT = 120
-RAGAS_TIMEOUT = 240
-RAGAS_BATCH_SIZE = 1
-STRICT_RAGAS_ERRORS = False
-# Délai anti-429 entre appels réseau (embeddings/chat). À ajuster selon les limites de l'API Mistral et la taille du jeu de données, en l'état 0.25 fonctionne.
-REQUEST_DELAY_SECONDS = 0.25
-
-_LOGFIRE: Any | None = None
-
-
-class RetrievedContext(BaseModel):
-    """Schéma de validation d'un contexte retourné par le retriever."""
-
-    text: str = Field(min_length=1)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    score: float = 0.0
-
-    @field_validator("text")
-    @classmethod
-    def _normalize_text(cls, value: str) -> str:
-        cleaned = str(value).strip()
-        if not cleaned:
-            raise ValueError("Le champ `text` du contexte est vide.")
-        return cleaned
-
-    @field_validator("score", mode="before")
-    @classmethod
-    def _coerce_score(cls, value: Any) -> float:
-        if value is None:
-            return 0.0
-        try:
-            return float(value)
-        except Exception as exc:
-            raise ValueError("Le champ `score` doit être numérique.") from exc
-
-    @field_validator("metadata", mode="before")
-    @classmethod
-    def _normalize_metadata(cls, value: Any) -> dict[str, Any]:
-        if value is None:
-            return {}
-        if isinstance(value, dict):
-            return value
-        raise ValueError("Le champ `metadata` doit être un objet clé/valeur.")
-
-
-class GeneratedAnswerPayload(BaseModel):
-    """Schéma de validation d'une réponse générée + tokens."""
-
-    answer: str = Field(min_length=1)
-    input_tokens: int | None = Field(default=None, ge=0)
-    output_tokens: int | None = Field(default=None, ge=0)
-    total_tokens: int | None = Field(default=None, ge=0)
-
-    @field_validator("answer")
-    @classmethod
-    def _normalize_answer(cls, value: str) -> str:
-        cleaned = str(value).strip()
-        if not cleaned:
-            raise ValueError("La réponse générée est vide.")
-        return cleaned
-
-    @model_validator(mode="after")
-    def _check_total_tokens(self) -> "GeneratedAnswerPayload":
-        if (
-            self.total_tokens is not None
-            and self.input_tokens is not None
-            and self.output_tokens is not None
-            and self.total_tokens < (self.input_tokens + self.output_tokens)
-        ):
-            raise ValueError("`total_tokens` est incohérent avec input/output tokens.")
-        return self
-
-
-class EvaluationSample(BaseModel):
-    """Schéma de validation d'un échantillon complet évalué par RAGAS."""
-
-    sample_index: int = Field(ge=0)
-    id: str = Field(min_length=1)
-    category: str = Field(min_length=1)
-    question: str = Field(min_length=1)
-    answer: str = Field(min_length=1)
-    contexts: list[str] = Field(default_factory=list)
-    ground_truth: str = Field(min_length=1)
-    retrieval_keywords: list[str] = Field(default_factory=list)
-    retrieval_queries: list[str] = Field(default_factory=list)
-    sql_used: bool
-    sql_query: str | None = None
-    retrieval_latency_s: float = Field(ge=0.0)
-    generation_latency_s: float = Field(ge=0.0)
-    total_latency_s: float = Field(ge=0.0)
-    input_tokens: int | None = Field(default=None, ge=0)
-    output_tokens: int | None = Field(default=None, ge=0)
-    total_tokens: int | None = Field(default=None, ge=0)
-
-    @field_validator("id", "category", "question", "answer", "ground_truth")
-    @classmethod
-    def _normalize_required_text(cls, value: str) -> str:
-        cleaned = str(value).strip()
-        if not cleaned:
-            raise ValueError("Champ textuel obligatoire vide.")
-        return cleaned
-
-    @field_validator("contexts", mode="before")
-    @classmethod
-    def _normalize_contexts(cls, value: Any) -> list[str]:
-        if value is None:
-            return []
-        if not isinstance(value, list):
-            raise ValueError("`contexts` doit être une liste de chaînes.")
-        normalized = [str(item).strip() for item in value if str(item).strip()]
-        return normalized
-
-
-class SQLToolResultPayload(BaseModel):
-    """Schéma de validation d'une sortie du Tool SQL."""
-
-    status: str = Field(min_length=1)
-    sql: str | None = None
-    rows: list[dict[str, Any]] = Field(default_factory=list)
-    message: str | None = None
-
-    @field_validator("status")
-    @classmethod
-    def _normalize_status(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        allowed = {"ok", "no_tool", "error", "unknown"}
-        if normalized not in allowed:
-            raise ValueError(f"status SQL invalide: {value}")
-        return normalized
-
-    @model_validator(mode="after")
-    def _check_sql_consistency(self) -> "SQLToolResultPayload":
-        if self.status == "ok":
-            if not self.sql or not self.sql.strip():
-                raise ValueError("status=ok exige une requête SQL non vide.")
-        else:
-            if self.sql is not None and str(self.sql).strip():
-                raise ValueError("status!=ok ne doit pas exposer de requête SQL exploitable.")
-            if self.rows:
-                raise ValueError("status!=ok ne doit pas exposer de lignes SQL.")
-        return self
-
-
-class RagasRunOutput(BaseModel):
-    """Validation minimale de la sortie utile du pipeline d'évaluation."""
-
-    sample_count: int = Field(ge=0)
-    summary: dict[str, Any]
-    details_rows: int = Field(ge=0)
-
-    @model_validator(mode="after")
-    def _check_counts(self) -> "RagasRunOutput":
-        if self.details_rows and self.sample_count and self.details_rows != self.sample_count:
-            raise ValueError("Le nombre de lignes détaillées doit correspondre au nombre d'échantillons.")
-        return self
-
-
-def _configure_logfire() -> None:
-    """Initialise Pydantic Logfire en mode non bloquant."""
-    global _LOGFIRE
-    if not LOGFIRE_ENABLED:
-        LOGGER.info("Logfire désactivé (LOGFIRE_ENABLED=false).")
-        _LOGFIRE = None
-        return
-    try:
-        import logfire
-    except Exception:
-        LOGGER.info("Pydantic Logfire non installé : instrumentation désactivée.")
-        _LOGFIRE = None
-        return
-
-    try:
-        try:
-            logfire.configure(
-                service_name=LOGFIRE_SERVICE_NAME,
-                send_to_logfire=LOGFIRE_SEND_TO_LOGFIRE,
-            )
-        except TypeError:
-            logfire.configure()
-        try:
-            logfire.instrument_pydantic()
-        except Exception:
-            LOGGER.warning("Logfire actif, mais instrument_pydantic a échoué.")
-        _LOGFIRE = logfire
-        LOGGER.info("Pydantic Logfire activé.")
-    except Exception as exc:
-        LOGGER.warning("Impossible d'initialiser Logfire : %s", exc)
-        _LOGFIRE = None
-
-
-def _logfire_span(name: str, **attrs: Any) -> contextlib.AbstractContextManager[Any]:
-    """Retourne un span Logfire si disponible, sinon un no-op context."""
-    if _LOGFIRE is None:
-        return contextlib.nullcontext()
-    try:
-        return _LOGFIRE.span(name, **attrs)
-    except Exception:
-        return contextlib.nullcontext()
-
-
-def _logfire_event(level: str, message: str, **attrs: Any) -> None:
-    """Émet un événement Logfire si l'intégration est active."""
-    if _LOGFIRE is None:
-        return
-    try:
-        log_method = getattr(_LOGFIRE, level, None)
-        if callable(log_method):
-            log_method(message, **attrs)
-    except Exception:
-        return
-
-
-def _validate_retrieved_contexts(
-    raw_contexts: list[dict[str, Any]],
-    *,
-    sample_id: str,
-    retrieval_query: str,
-) -> list[dict[str, Any]]:
-    """Valide explicitement la structure des contextes retournés par retrieval."""
-    validated: list[dict[str, Any]] = []
-    for idx, context in enumerate(raw_contexts):
-        try:
-            parsed = RetrievedContext.model_validate(context)
-            validated.append(parsed.model_dump())
-        except ValidationError as exc:
-            LOGGER.warning(
-                "Contexte invalide ignoré (sample=%s, query=%s, index=%s): %s",
-                sample_id,
-                retrieval_query,
-                idx,
-                exc.errors(),
-            )
-            _logfire_event(
-                "warning",
-                "retrieved_context_validation_failed",
-                sample_id=sample_id,
-                retrieval_query=retrieval_query,
-                context_index=idx,
-                errors=exc.errors(),
-            )
-    return validated
-
-
-def _validate_generated_answer(
-    *,
-    answer: str,
-    usage: dict[str, int | None],
-    sample_id: str,
-) -> tuple[str, dict[str, int | None]]:
-    """Valide explicitement la réponse générée et ses compteurs de tokens."""
-    payload = {
-        "answer": answer,
-        "input_tokens": usage.get("input_tokens"),
-        "output_tokens": usage.get("output_tokens"),
-        "total_tokens": usage.get("total_tokens"),
-    }
-    validated = GeneratedAnswerPayload.model_validate(payload)
-    _logfire_event(
-        "info",
-        "generated_answer_validated",
-        sample_id=sample_id,
-        answer_length=len(validated.answer),
-    )
-    return validated.answer, {
-        "input_tokens": validated.input_tokens,
-        "output_tokens": validated.output_tokens,
-        "total_tokens": validated.total_tokens,
-    }
-
-
-def _validate_sample(sample: dict[str, Any]) -> dict[str, Any]:
-    """Valide explicitement un échantillon d'évaluation complet."""
-    validated = EvaluationSample.model_validate(sample)
-    _logfire_event(
-        "info",
-        "evaluation_sample_validated",
-        sample_id=validated.id,
-        category=validated.category,
-        contexts_count=len(validated.contexts),
-    )
-    return validated.model_dump()
-
 
 DEFAULT_QUESTIONS: list[dict[str, Any]] = [
     {
@@ -494,104 +215,89 @@ DEFAULT_QUESTIONS: list[dict[str, Any]] = [
 ]
 
 
-def _load_questions() -> list[dict[str, Any]]:
-    """Normalise la liste des questions d'évaluation.
-
-    La fonction accepte la structure embarquée dans `DEFAULT_QUESTIONS`,
-    déduplique les identifiants et homogénéise les champs attendus par le reste
-    du pipeline.
-
-    Returns:
-        list[dict[str, Any]]: La liste normalisée des questions.
-
-    Raises:
-        ValueError: Si `DEFAULT_QUESTIONS` n'est ni une liste ni un dictionnaire
-            contenant une clé `questions`.
-    """
-    raw_data: Any = DEFAULT_QUESTIONS
-
-    if isinstance(raw_data, dict) and "questions" in raw_data:
-        raw_data = raw_data["questions"]
-    if not isinstance(raw_data, list):
-        raise ValueError("DEFAULT_QUESTIONS doit être une liste ou {'questions': [...]} ")
-
-    normalized: list[dict[str, Any]] = []
-    used_ids: set[str] = set()
-    for idx, row in enumerate(raw_data, start=1):
-        raw_keywords = row.get("retrieval_keywords", []) if isinstance(row, dict) else []
-        keywords: list[str] = []
-        if isinstance(raw_keywords, list):
-            keywords = [str(item).strip() for item in raw_keywords if str(item).strip()]
-
-        raw_id = str(row.get("id", f"q{idx}")).strip() if isinstance(row, dict) else f"q{idx}"
-        if not raw_id:
-            raw_id = f"q{idx}"
-        final_id = raw_id
-        suffix = 2
-        while final_id in used_ids:
-            final_id = f"{raw_id}_{suffix}"
-            suffix += 1
-        if final_id != raw_id:
-            LOGGER.warning(
-                "ID de question dupliqué (%s). Renommé automatiquement en %s.",
-                raw_id,
-                final_id,
-            )
-        used_ids.add(final_id)
-
-        normalized.append(
-            {
-                "id": final_id,
-                "category": str(row.get("category", "non_categorise")) if isinstance(row, dict) else "non_categorise",
-                "question": str(row["question"]) if isinstance(row, dict) else str(row),
-                "ground_truth": str(row.get("ground_truth", "")) if isinstance(row, dict) else "",
-                "retrieval_keywords": keywords,
-            }
-        )
-    return normalized
-
-
-def _truncate_context(text: str, max_chars: int = 1200) -> str:
-    """Nettoie et tronque un contexte textuel.
-
-    Args:
-        text: Le texte brut à nettoyer.
-        max_chars: Le nombre maximal de caractères à conserver.
-
-    Returns:
-        str: Le texte nettoyé et tronqué.
-    """
-    clean = " ".join(text.split())
-    clean = re.sub(r"\bNaN\b", "", clean)
-    clean = re.sub(r"\s{2,}", " ", clean).strip()
-    return clean[:max_chars]
-
-
 def _sleep_between_requests() -> None:
-    """Applique un délai synchrone entre deux requêtes si configuré."""
     if REQUEST_DELAY_SECONDS > 0:
         time.sleep(REQUEST_DELAY_SECONDS)
 
 
 async def _async_sleep_between_requests() -> None:
-    """Applique un délai asynchrone entre deux requêtes si configuré."""
     if REQUEST_DELAY_SECONDS > 0:
         await asyncio.sleep(REQUEST_DELAY_SECONDS)
 
 
+def _truncate_context(text: str, max_chars: int = 1200) -> str:
+    clean = " ".join(str(text).split())
+    clean = re.sub(r"\bNaN\b", "", clean)
+    clean = re.sub(r"\s{2,}", " ", clean).strip()
+    return clean[:max_chars]
+
+
+def _normalize_text_for_match(text: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in items:
+        value = str(item).strip()
+        if not value:
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(value)
+    return deduped
+
+
+def _derive_keywords_from_reference(reference: str, max_keywords: int = 12) -> list[str]:
+    tokens = re.findall(r"[a-zA-Z0-9]+", reference.lower())
+    keywords: list[str] = []
+    for token in tokens:
+        if token in FRENCH_STOPWORDS:
+            continue
+        if len(token) < 3 and not token.isdigit():
+            continue
+        keywords.append(token)
+    return _dedupe_keep_order(keywords)[:max_keywords]
+
+
+def _resolve_retrieval_keywords(sample: dict[str, Any]) -> list[str]:
+    raw = sample.get("retrieval_keywords")
+    if isinstance(raw, list):
+        explicit = _dedupe_keep_order([str(item).strip() for item in raw if str(item).strip()])
+        if explicit:
+            return explicit
+    return _derive_keywords_from_reference(str(sample.get("ground_truth", "")))
+
+
+def _build_retrieval_queries(question: str, retrieval_keywords: list[str], max_queries: int = 3) -> list[str]:
+    queries = [question.strip()]
+    keywords = _dedupe_keep_order(retrieval_keywords)
+    if keywords:
+        queries.append(" ".join(keywords[:6]))
+        queries.append(f"{question.strip()} {' '.join(keywords[:4])}".strip())
+    return _dedupe_keep_order([q for q in queries if q])[:max_queries]
+
+
+def _merge_retrieval_results(batches: list[list[dict[str, Any]]], k: int) -> list[dict[str, Any]]:
+    by_key: dict[str, dict[str, Any]] = {}
+    for batch in batches:
+        for item in batch:
+            text = str(item.get("text", "")).strip()
+            metadata = item.get("metadata", {})
+            key = f"{text}||{json.dumps(metadata, sort_keys=True, ensure_ascii=False, default=str)}"
+            score = float(item.get("score", 0.0))
+            current = by_key.get(key)
+            if current is None or score > float(current.get("score", 0.0)):
+                by_key[key] = item
+    merged = sorted(by_key.values(), key=lambda x: float(x.get("score", 0.0)), reverse=True)
+    return merged[:k]
+
+
 def _safe_int(value: Any) -> int | None:
-    """Convertit une valeur hétérogène en entier si possible.
-
-    Args:
-        value: La valeur à convertir.
-
-    Returns:
-        int | None: L'entier converti, ou `None` si la conversion est
-        impossible ou non pertinente.
-    """
-    if value is None:
-        return None
-    if isinstance(value, bool):
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         return int(value)
@@ -602,14 +308,6 @@ def _safe_int(value: Any) -> int | None:
 
 
 def _extract_usage_tokens(response: Any) -> dict[str, int | None]:
-    """Extrait les compteurs de tokens depuis une réponse Mistral.
-
-    Args:
-        response: La réponse brute retournée par le client Mistral.
-
-    Returns:
-        dict[str, int | None]: Les tokens d'entrée, de sortie et le total.
-    """
     usage = getattr(response, "usage", None)
     if usage is None and isinstance(response, dict):
         usage = response.get("usage")
@@ -639,169 +337,132 @@ def _extract_usage_tokens(response: Any) -> dict[str, int | None]:
     }
 
 
-def _normalize_text_for_match(text: str) -> str:
-    """Normalise un texte pour les comparaisons par recouvrement.
-
-    Args:
-        text: Le texte à normaliser.
-
-    Returns:
-        str: Le texte réduit à des tokens alphanumériques en minuscules.
-    """
-    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
-
-
-def _dedupe_keep_order(items: list[str]) -> list[str]:
-    """Supprime les doublons en conservant l'ordre d'origine.
-
-    Args:
-        items: La liste d'éléments à dédupliquer.
-
-    Returns:
-        list[str]: La liste dédupliquée.
-    """
-    seen: set[str] = set()
-    result: list[str] = []
-    for item in items:
-        normalized = item.strip()
-        if not normalized:
-            continue
-        key = normalized.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(normalized)
-    return result
-
-
-def _derive_keywords_from_reference(reference: str, max_keywords: int = 12) -> list[str]:
-    """Construit des mots-clés de retrieval à partir de la référence.
-
-    Args:
-        reference: La réponse de référence utilisée comme source.
-        max_keywords: Le nombre maximal de mots-clés à retourner.
-
-    Returns:
-        list[str]: Les mots-clés déduits depuis la référence.
-    """
-    tokens = re.findall(r"[a-zA-Z0-9]+", reference.lower())
-    keywords: list[str] = []
-    for token in tokens:
-        if token in FRENCH_STOPWORDS:
-            continue
-        if len(token) < 3 and not token.isdigit():
-            continue
-        keywords.append(token)
-    return _dedupe_keep_order(keywords)[:max_keywords]
-
-
-def _resolve_retrieval_keywords(sample: dict[str, Any]) -> list[str]:
-    """Résout les mots-clés de retrieval pour un échantillon.
-
-    La fonction privilégie les mots-clés explicitement définis dans
-    l'échantillon et retombe sur une dérivation depuis la référence si besoin.
-
-    Args:
-        sample: L'échantillon à enrichir.
-
-    Returns:
-        list[str]: Les mots-clés utilisables pour le retrieval.
-    """
-    raw = sample.get("retrieval_keywords")
-    if isinstance(raw, list):
-        explicit = [str(item).strip() for item in raw if str(item).strip()]
-        explicit = _dedupe_keep_order(explicit)
-        if explicit:
-            return explicit
-    return _derive_keywords_from_reference(str(sample.get("ground_truth", "")))
-
-
-def _build_retrieval_queries(
+def _validate_retrieved_contexts(
+    raw_contexts: list[dict[str, Any]],
     *,
-    question: str,
-    retrieval_keywords: list[str],
-    max_queries: int = 3,
-) -> list[str]:
-    """Construit plusieurs requêtes pour améliorer le recall du retrieval.
-
-    Args:
-        question: La question utilisateur d'origine.
-        retrieval_keywords: Les mots-clés servant à ancrer les requêtes.
-        max_queries: Le nombre maximal de requêtes à retourner.
-
-    Returns:
-        list[str]: Les requêtes de retrieval dédupliquées.
-    """
-    queries: list[str] = [question.strip()]
-    keywords = _dedupe_keep_order([kw.strip() for kw in retrieval_keywords if kw and kw.strip()])
-
-    if keywords:
-        # Requête compacte orientée entités/valeurs clés.
-        queries.append(" ".join(keywords[:6]))
-        # Requête hybride pour conserver l'intention tout en forçant les ancres.
-        queries.append(f"{question.strip()} {' '.join(keywords[:4])}".strip())
-
-    queries = _dedupe_keep_order([q for q in queries if q])
-    return queries[:max_queries]
-
-
-def _merge_retrieval_results(
-    batches: list[list[dict[str, Any]]],
-    *,
-    k: int,
+    sample_id: str,
+    retrieval_query: str,
 ) -> list[dict[str, Any]]:
-    """Fusionne plusieurs lots de résultats en supprimant les doublons.
+    validated: list[dict[str, Any]] = []
+    for index, context in enumerate(raw_contexts):
+        try:
+            parsed = RetrievedContext.model_validate(context)
+            validated.append(parsed.model_dump())
+        except Exception as exc:
+            LOGGER.warning(
+                "Contexte invalide ignoré (sample=%s, query=%s, idx=%s): %s",
+                sample_id,
+                retrieval_query,
+                index,
+                exc,
+            )
+            logfire_event(
+                "warning",
+                "retrieved_context_invalid",
+                sample_id=sample_id,
+                retrieval_query=retrieval_query,
+                index=index,
+                error=str(exc),
+            )
+    return validated
 
-    Args:
-        batches: Les lots de résultats retournés par différentes requêtes.
-        k: Le nombre maximal de résultats finaux à conserver.
 
-    Returns:
-        list[dict[str, Any]]: Les meilleurs résultats fusionnés.
-    """
-    by_key: dict[str, dict[str, Any]] = {}
+def _validate_generated_answer(
+    *,
+    answer: str,
+    usage: dict[str, int | None],
+    sample_id: str,
+) -> tuple[str, dict[str, int | None]]:
+    validated = GeneratedAnswerUsage.model_validate(
+        {
+            "answer": answer,
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+        }
+    )
+    logfire_event("info", "generated_answer_validated", sample_id=sample_id)
+    return validated.answer, {
+        "input_tokens": validated.input_tokens,
+        "output_tokens": validated.output_tokens,
+        "total_tokens": validated.total_tokens,
+    }
 
-    for results in batches:
-        for item in results:
-            text = str(item.get("text", "")).strip()
-            metadata = item.get("metadata", {})
-            meta_dump = json.dumps(metadata, sort_keys=True, ensure_ascii=False, default=str)
-            key = f"{text}||{meta_dump}"
-            score = float(item.get("score", 0.0))
 
-            existing = by_key.get(key)
-            if existing is None or score > float(existing.get("score", 0.0)):
-                by_key[key] = item
+def _validate_sample(sample: dict[str, Any]) -> dict[str, Any]:
+    return EvaluationSample.model_validate(sample).model_dump()
 
-    merged = sorted(by_key.values(), key=lambda x: float(x.get("score", 0.0)), reverse=True)
-    return merged[:k]
+
+def _load_questions() -> list[dict[str, Any]]:
+    raw = DEFAULT_QUESTIONS
+    if isinstance(raw, dict) and "questions" in raw:
+        raw = raw["questions"]
+    if not isinstance(raw, list):
+        raise ValueError("DEFAULT_QUESTIONS doit être une liste (ou {'questions': [...]})")
+
+    normalized: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+
+    for index, row in enumerate(raw, start=1):
+        if not isinstance(row, dict):
+            row = {"question": str(row)}
+
+        raw_id = str(row.get("id", f"q{index}")).strip() or f"q{index}"
+        final_id = raw_id
+        suffix = 2
+        while final_id in used_ids:
+            final_id = f"{raw_id}_{suffix}"
+            suffix += 1
+        used_ids.add(final_id)
+
+        normalized.append(
+            {
+                "id": final_id,
+                "category": str(row.get("category", "non_categorise")).strip() or "non_categorise",
+                "question": str(row.get("question", "")).strip(),
+                "ground_truth": str(row.get("ground_truth", "")).strip(),
+                "retrieval_keywords": _dedupe_keep_order(
+                    [str(item).strip() for item in row.get("retrieval_keywords", []) if str(item).strip()]
+                ),
+            }
+        )
+
+    return normalized
 
 
 def _build_prompt(question: str, contexts: list[str], sql_context: str) -> str:
-    """Construit le prompt de génération à partir de la question et du contexte.
-
-    Args:
-        question: La question à poser au modèle.
-        contexts: Les contexts récupérés par le retriever.
-
-    Returns:
-        str: Le prompt final envoyé au modèle.
-    """
-    formatted_context = "\n\n".join([f"[{i + 1}] {ctx}" for i, ctx in enumerate(contexts)])
+    context_block = "\n\n".join([f"[{i + 1}] {ctx}" for i, ctx in enumerate(contexts)])
     return (
-        "Réponds uniquement avec les informations présentes dans le CONTEXTE. "
-        "Quand une sortie SQL est fournie, tu peux t'en servir comme donnée structurée fiable. "
-        "Si des valeurs numériques sont présentes, cite-les explicitement. "
-        "Tu peux faire un calcul simple (différence, comparaison) uniquement à partir des valeurs du contexte. "
-        "Si l'information est absente, réponds exactement : Information non disponible dans le contexte.\n\n"
-        f"CONTEXTE:\n{formatted_context}\n\n"
+        "Réponds uniquement avec les informations présentes dans le CONTEXTE et le SQL_CONTEXT. "
+        "Si l'information est absente, réponds exactement: Information non disponible dans le contexte.\n\n"
+        f"CONTEXTE:\n{context_block}\n\n"
         f"SQL_CONTEXT:\n{sql_context}\n\n"
         f"QUESTION:\n{question}\n\n"
         "RÉPONSE FINALE :"
     )
 
 
+def _build_sql_context(question: str) -> tuple[str, bool, str | None]:
+    try:
+        result = SQLToolResult.model_validate(answer_question_sql_via_langchain(question))
+    except Exception as exc:
+        logfire_event("error", "sql_tool_invalid", question=question, error=str(exc))
+        return f"Echec du tool SQL: {exc}", False, None
+
+    if result.status == "no_tool":
+        return result.message or "Aucun appel SQL jugé nécessaire.", False, None
+    if result.status != "ok":
+        return f"Tool SQL indisponible: {result.message}", False, None
+
+    return (
+        f"SQL: {result.sql}\nRows (max 10): {result.rows[:10]}",
+        True,
+        result.sql,
+    )
+
+
 def _generate_answer(
+    *,
     client: Mistral,
     model: str,
     question: str,
@@ -809,88 +470,35 @@ def _generate_answer(
     sql_context: str,
     sample_id: str,
 ) -> tuple[str, dict[str, int | None]]:
-    """Génère une réponse Mistral contrainte par les contexts.
-
-    Args:
-        client: Le client Mistral déjà initialisé.
-        model: Le nom du modèle à utiliser.
-        question: La question à traiter.
-        contexts: Les contexts transmis au modèle.
-        sample_id: L'identifiant de l'échantillon évalué.
-
-    Returns:
-        tuple[str, dict[str, int | None]]: La réponse produite et les
-        informations de consommation de tokens.
-    """
     if not contexts:
         return (
             "Contexte insuffisant dans le vector store pour répondre à cette question.",
             {"input_tokens": None, "output_tokens": None, "total_tokens": None},
         )
 
-    prompt = _build_prompt(question=question, contexts=contexts, sql_context=sql_context)
     try:
-        with _logfire_span("generate_answer", sample_id=sample_id, model=model):
+        with logfire_span("generate_answer", sample_id=sample_id, model=model):
             response = client.chat.complete(
                 model=model,
                 messages=[
                     {
                         "role": "system",
-                        "content": "Tu es un assistant NBA. Utilise uniquement le contexte fourni et évite toute hallucination.",
+                        "content": "Tu es un assistant NBA. Utilise uniquement le contexte fourni.",
                     },
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": _build_prompt(question, contexts, sql_context)},
                 ],
                 temperature=0.0,
             )
-            answer = response.choices[0].message.content.strip()
+            answer = (response.choices[0].message.content or "").strip()
             usage = _extract_usage_tokens(response)
-            return _validate_generated_answer(
-                answer=answer,
-                usage=usage,
-                sample_id=sample_id,
-            )
+            return _validate_generated_answer(answer=answer, usage=usage, sample_id=sample_id)
     except Exception as exc:
-        LOGGER.exception("Échec de génération pour la question : %s", question)
-        _logfire_event(
-            "error",
-            "generate_answer_failed",
-            sample_id=sample_id,
-            question=question,
-            error=str(exc),
-        )
+        LOGGER.exception("Echec de génération (sample=%s)", sample_id)
+        logfire_event("error", "generate_answer_failed", sample_id=sample_id, error=str(exc))
         return (
             f"Erreur de génération : {exc}",
             {"input_tokens": None, "output_tokens": None, "total_tokens": None},
         )
-
-
-def _build_sql_context(question: str) -> tuple[str, bool, str | None]:
-    """Construit le contexte SQL à injecter dans le prompt de génération.
-
-    Returns:
-        tuple[str, bool, str | None]: (contexte SQL, sql_utilise, sql_query)
-    """
-    try:
-        raw_result = answer_question_sql_via_langchain(question)
-        result = SQLToolResultPayload.model_validate(raw_result).model_dump()
-    except Exception as exc:
-        _logfire_event("error", "sql_tool_validation_failed", question=question, error=str(exc))
-        return f"Echec du tool SQL: {exc}", False, None
-
-    if result.get("status") == "no_tool":
-        return str(result.get("message", "Aucun appel SQL jugé nécessaire.")), False, None
-
-    if result.get("status") != "ok":
-        return f"Tool SQL indisponible: {result.get('message')}", False, None
-
-    sql_query = result.get("sql")
-    rows = result.get("rows", [])
-    preview_rows = rows[:10]
-    return (
-        f"SQL: {sql_query}\nRows (max 10): {preview_rows}",
-        True,
-        sql_query,
-    )
 
 
 def _build_samples(
@@ -898,99 +506,80 @@ def _build_samples(
     questions: list[dict[str, Any]],
     retriever: VectorStoreManager,
     client: Mistral,
-    model: str,
-    k: int,
-    min_score: float | None,
 ) -> list[dict[str, Any]]:
-    """Construit les échantillons évaluables à partir des questions.
-
-    Pour chaque question, la fonction exécute le retrieval, prépare les
-    contexts, appelle le modèle de génération puis enrichit l'échantillon avec
-    des métadonnées opérationnelles.
-
-    Args:
-        questions: Les questions d'évaluation normalisées.
-        retriever: Le gestionnaire de Vector Store.
-        client: Le client Mistral utilisé pour la génération.
-        model: Le nom du modèle de génération.
-        k: Le nombre maximal de contexts à conserver.
-        min_score: Le score minimal de retrieval à appliquer, si défini.
-
-    Returns:
-        list[dict[str, Any]]: Les échantillons prêts pour l'évaluation.
-
-    Raises:
-        RuntimeError: Si le nombre d'échantillons produits est incohérent avec
-            le nombre de questions d'entrée.
-    """
     samples: list[dict[str, Any]] = []
-    for sample_index, row in enumerate(questions):
-        with _logfire_span("build_sample", sample_id=row["id"], category=row["category"]):
-            sample_start = time.perf_counter()
+
+    for sample_index, question_row in enumerate(questions):
+        sample_id = question_row["id"]
+        with logfire_span("build_sample", sample_id=sample_id):
+            total_start = time.perf_counter()
 
             retrieval_start = time.perf_counter()
             retrieval_queries = _build_retrieval_queries(
-                question=row["question"],
-                retrieval_keywords=list(row.get("retrieval_keywords", [])),
+                question=question_row["question"],
+                retrieval_keywords=_resolve_retrieval_keywords(question_row),
             )
-            retrieval_batches: list[list[dict[str, Any]]] = []
+            batches: list[list[dict[str, Any]]] = []
             for query in retrieval_queries:
                 _sleep_between_requests()
-                batch = retriever.search(query, k=k, min_score=min_score)
-                if batch:
-                    validated_batch = _validate_retrieved_contexts(
-                        batch,
-                        sample_id=row["id"],
-                        retrieval_query=query,
-                    )
-                    if validated_batch:
-                        retrieval_batches.append(validated_batch)
-            search_results = _merge_retrieval_results(retrieval_batches, k=k)
-            retrieval_latency_s = round(time.perf_counter() - retrieval_start, 6)
+                raw_batch = retriever.search(query, k=EVAL_K, min_score=EVAL_MIN_SCORE)
+                if not raw_batch:
+                    continue
+                validated_batch = _validate_retrieved_contexts(
+                    raw_batch,
+                    sample_id=sample_id,
+                    retrieval_query=query,
+                )
+                if validated_batch:
+                    batches.append(validated_batch)
+            search_results = _merge_retrieval_results(batches, k=EVAL_K)
+            retrieval_latency = round(time.perf_counter() - retrieval_start, 6)
 
-            contexts = [_truncate_context(r.get("text", "")) for r in search_results]
-            contexts = [c for c in contexts if c and len(c.strip()) > 30]
+            contexts = [_truncate_context(item.get("text", "")) for item in search_results]
+            contexts = [ctx for ctx in contexts if len(ctx.strip()) > 30]
 
-            sql_context, sql_used, sql_query = _build_sql_context(row["question"])
+            sql_context, sql_used, sql_query = _build_sql_context(question_row["question"])
 
             generation_start = time.perf_counter()
             _sleep_between_requests()
             answer, usage = _generate_answer(
                 client=client,
-                model=model,
-                question=row["question"],
+                model=SETTINGS.model_name,
+                question=question_row["question"],
                 contexts=contexts,
                 sql_context=sql_context,
-                sample_id=row["id"],
+                sample_id=sample_id,
             )
-            generation_latency_s = round(time.perf_counter() - generation_start, 6)
+            generation_latency = round(time.perf_counter() - generation_start, 6)
+            total_latency = round(time.perf_counter() - total_start, 6)
 
-            total_latency_s = round(time.perf_counter() - sample_start, 6)
-            sample = {
-                "sample_index": sample_index,
-                "id": row["id"],
-                "category": row["category"],
-                "question": row["question"],
-                "answer": answer,
-                "contexts": contexts,
-                "ground_truth": row["ground_truth"],
-                "retrieval_keywords": row.get("retrieval_keywords", []),
-                "retrieval_queries": retrieval_queries,
-                "sql_used": sql_used,
-                "sql_query": sql_query,
-                "retrieval_latency_s": retrieval_latency_s,
-                "generation_latency_s": generation_latency_s,
-                "total_latency_s": total_latency_s,
-                "input_tokens": usage["input_tokens"],
-                "output_tokens": usage["output_tokens"],
-                "total_tokens": usage["total_tokens"],
-            }
-            sample = _validate_sample(sample)
+            sample = _validate_sample(
+                {
+                    "sample_index": sample_index,
+                    "id": sample_id,
+                    "category": question_row["category"],
+                    "question": question_row["question"],
+                    "answer": answer,
+                    "contexts": contexts,
+                    "ground_truth": question_row["ground_truth"],
+                    "retrieval_keywords": question_row.get("retrieval_keywords", []),
+                    "retrieval_queries": retrieval_queries,
+                    "sql_used": sql_used,
+                    "sql_query": sql_query,
+                    "retrieval_latency_s": retrieval_latency,
+                    "generation_latency_s": generation_latency,
+                    "total_latency_s": total_latency,
+                    "input_tokens": usage["input_tokens"],
+                    "output_tokens": usage["output_tokens"],
+                    "total_tokens": usage["total_tokens"],
+                }
+            )
             samples.append(sample)
+
         LOGGER.info(
-            "Échantillon généré %s (%s) - requêtes retrieval=%s, contexts=%s",
-            sample["id"],
-            sample["category"],
+            "Echantillon genere %s (%s) - retrieval_queries=%s, contexts=%s",
+            sample_id,
+            question_row["category"],
             len(retrieval_queries),
             len(contexts),
         )
@@ -1000,26 +589,11 @@ def _build_samples(
         raise RuntimeError(
             f"Nombre d'échantillons incohérent ({len(samples)}) pour {len(questions)} questions."
         )
+
     return samples
 
 
-def _compute_retrieval_metrics_for_sample(
-    sample: dict[str, Any],
-    *,
-    overlap_threshold: float,
-) -> dict[str, float | int | None]:
-    """Calcule les métriques de retrieval pour un échantillon.
-
-    Args:
-        sample: L'échantillon enrichi avec sa question, ses contexts et sa
-            référence.
-        overlap_threshold: Le seuil de recouvrement à partir duquel un contexte
-            est considéré comme pertinent.
-
-    Returns:
-        dict[str, float | int | None]: Les métriques de retrieval calculées
-        pour l'échantillon.
-    """
+def _compute_retrieval_metrics_for_sample(sample: dict[str, Any]) -> dict[str, float | int | None]:
     contexts = [str(ctx) for ctx in sample.get("contexts", []) if str(ctx).strip()]
     keywords = _resolve_retrieval_keywords(sample)
 
@@ -1054,26 +628,21 @@ def _compute_retrieval_metrics_for_sample(
         per_context_relevance.append(len(hits) / len(normalized_keywords))
         covered_keywords.update(hits)
 
-    relevant_flags = [score >= overlap_threshold for score in per_context_relevance]
+    relevant_flags = [score >= RETRIEVAL_OVERLAP_THRESHOLD for score in per_context_relevance]
     relevant_count = sum(1 for flag in relevant_flags if flag)
+
     precision_at_k = relevant_count / len(normalized_contexts)
     recall_at_k = len(covered_keywords) / len(normalized_keywords)
 
     mrr = 0.0
-    for idx, is_relevant in enumerate(relevant_flags, start=1):
+    for rank, is_relevant in enumerate(relevant_flags, start=1):
         if is_relevant:
-            mrr = 1.0 / idx
+            mrr = 1.0 / rank
             break
 
-    dcg = sum(
-        ((2**rel) - 1) / math.log2(idx + 2)
-        for idx, rel in enumerate(per_context_relevance)
-    )
+    dcg = sum(((2**rel) - 1) / math.log2(rank + 2) for rank, rel in enumerate(per_context_relevance))
     ideal = sorted(per_context_relevance, reverse=True)
-    idcg = sum(
-        ((2**rel) - 1) / math.log2(idx + 2)
-        for idx, rel in enumerate(ideal)
-    )
+    idcg = sum(((2**rel) - 1) / math.log2(rank + 2) for rank, rel in enumerate(ideal))
     ndcg = dcg / idcg if idcg > 0 else 0.0
 
     return {
@@ -1086,27 +655,9 @@ def _compute_retrieval_metrics_for_sample(
     }
 
 
-def _build_additional_metrics_dataframe(
-    samples: list[dict[str, Any]],
-    *,
-    overlap_threshold: float,
-) -> pd.DataFrame:
-    """Construit le DataFrame des métriques additionnelles hors RAGAS.
-
-    Args:
-        samples: Les échantillons produits par le pipeline.
-        overlap_threshold: Le seuil de recouvrement pour les métriques de
-            retrieval.
-
-    Returns:
-        pd.DataFrame: Le tableau des métriques complémentaires.
-    """
+def _build_additional_metrics_dataframe(samples: list[dict[str, Any]]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for sample in samples:
-        retrieval_metrics = _compute_retrieval_metrics_for_sample(
-            sample,
-            overlap_threshold=overlap_threshold,
-        )
         rows.append(
             {
                 "sample_index": sample["sample_index"],
@@ -1118,286 +669,164 @@ def _build_additional_metrics_dataframe(
                 "output_tokens": sample.get("output_tokens"),
                 "total_tokens": sample.get("total_tokens"),
                 "sql_used": 1.0 if sample.get("sql_used") else 0.0,
-                **retrieval_metrics,
+                **_compute_retrieval_metrics_for_sample(sample),
             }
         )
     return pd.DataFrame(rows)
 
 
-def _resolve_ragas_metrics(
-    *,
-    llm: Any,
-    embeddings: Any,
-) -> tuple[Any, list[Any], list[str]]:
-    """Résout les métriques RAGAS selon la version installée.
-
-    La fonction tente d'abord l'API moderne, puis applique un fallback
-    compatible avec des versions plus anciennes de RAGAS.
-
-    Args:
-        llm: Le wrapper LLM compatible RAGAS.
-        embeddings: Le wrapper d'embeddings compatible RAGAS.
-
-    Returns:
-        tuple[Any, list[Any], list[str]]: La fonction `evaluate`, la liste des
-        métriques activées et leurs noms.
-    """
-    from ragas import evaluate
-
-    try:
-        # API recommandée par RAGAS.
-        from ragas.metrics.collections import (
-            AnswerRelevancy,
-            ContextPrecision,
-            ContextRecall,
-            Faithfulness,
-        )
-
-        metrics = [
-            AnswerRelevancy(llm=llm, embeddings=embeddings),
-            Faithfulness(llm=llm),
-            ContextPrecision(llm=llm),
-        ]
-        if INCLUDE_CONTEXT_RECALL:
-            metrics.append(ContextRecall(llm=llm))
-        metric_names = [getattr(metric, "name", metric.__class__.__name__) for metric in metrics]
-        return evaluate, metrics, metric_names
-    except Exception as exc:
-        message = str(exc)
-        if "Collections metrics only support modern InstructorLLM" in message:
-            LOGGER.info(
-                "Les collections RAGAS ne sont pas compatibles avec LangchainLLMWrapper, fallback activé.",
-            )
-        else:
-            LOGGER.warning(
-                "Impossible de charger les métriques RAGAS avancées (fallback restreint) : %s",
-                exc,
-            )
-        # Compatibilité ascendante selon la version installée.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            from ragas.metrics import (
-                AnswerRelevancy,
-                ContextPrecision,
-                ContextRecall,
-                Faithfulness,
-                answer_relevancy,
-                context_precision,
-                context_recall,
-                faithfulness,
-            )
-
-        metrics: list[Any] = []
-        metric_names: list[str] = []
-        fallback_metrics: list[Any] = [
-            AnswerRelevancy(llm=llm, embeddings=embeddings),
-            Faithfulness(llm=llm),
-            ContextPrecision(llm=llm),
-        ]
-
-        for metric_obj in fallback_metrics:
-            metrics.append(metric_obj)
-            metric_names.append(getattr(metric_obj, "name", metric_obj.__class__.__name__))
-
-        if INCLUDE_CONTEXT_RECALL:
-            recall_metric = ContextRecall(llm=llm)
-            metrics.append(recall_metric)
-            metric_names.append(getattr(recall_metric, "name", recall_metric.__class__.__name__))
-
-        # Fallback ultime si la version expose uniquement les objets globaux.
-        if not metrics:
-            metrics = [answer_relevancy, faithfulness, context_precision]
-            if INCLUDE_CONTEXT_RECALL:
-                metrics.append(context_recall)
-            metric_names = [str(metric) for metric in metrics]
-
-        return evaluate, metrics, metric_names
-
-def _resolve_ragas_models() -> tuple[Any | None, Any | None]:
-    """Initialise les wrappers Mistral attendus par RAGAS.
-
-    Returns:
-        tuple[Any | None, Any | None]: Le wrapper LLM et le wrapper
-        d'embeddings compatibles RAGAS.
-
-    Raises:
-        RuntimeError: Si la configuration Mistral ou les dépendances ne
-            permettent pas d'initialiser RAGAS correctement.
-    """
+def _resolve_ragas_models() -> tuple[Any, Any]:
     try:
         try:
             from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
         except Exception:
             from langchain_mistralai.chat_models import ChatMistralAI
             from langchain_mistralai.embeddings import MistralAIEmbeddings
+
         from ragas.embeddings import LangchainEmbeddingsWrapper
         from ragas.llms import LangchainLLMWrapper
-
-        # Contournement d'un bug connu : certaines réponses Mistral renvoient
-        # des token_usage imbriqués (dict dans dict), ce qui casse l'addition
-        # naïve de langchain-mistralai.
-        class SafeChatMistralAI(ChatMistralAI):
-            """Version sûre de `ChatMistralAI` pour agréger les token usages."""
-
-            def _combine_llm_outputs(self, llm_outputs: list[dict | None]) -> dict:
-                """Fusionne proprement les compteurs de tokens imbriqués.
-
-                Args:
-                    llm_outputs: Les sorties unitaires retournées par LangChain.
-
-                Returns:
-                    dict: Les compteurs fusionnés et le nom du modèle.
-                """
-                overall_token_usage: dict[str, Any] = {}
-
-                for output in llm_outputs:
-                    if not output:
-                        continue
-                    token_usage = output.get("token_usage")
-                    if not token_usage:
-                        continue
-
-                    for key, value in token_usage.items():
-                        if isinstance(value, (int, float)):
-                            overall_token_usage[key] = overall_token_usage.get(key, 0) + value
-                            continue
-
-                        if isinstance(value, dict):
-                            previous = overall_token_usage.get(key, {})
-                            if not isinstance(previous, dict):
-                                previous = {}
-                            merged = dict(previous)
-                            for sub_key, sub_value in value.items():
-                                if isinstance(sub_value, (int, float)):
-                                    merged[sub_key] = merged.get(sub_key, 0) + sub_value
-                                else:
-                                    merged[sub_key] = sub_value
-                            overall_token_usage[key] = merged
-                            continue
-
-                        overall_token_usage[key] = value
-
-                return {"token_usage": overall_token_usage, "model_name": self.model}
-
-        class ThrottledChatMistralAI(SafeChatMistralAI):
-            def _generate(self, *args: Any, **kwargs: Any) -> Any:
-                _sleep_between_requests()
-                return super()._generate(*args, **kwargs)
-
-            async def _agenerate(self, *args: Any, **kwargs: Any) -> Any:
-                await _async_sleep_between_requests()
-                return await super()._agenerate(*args, **kwargs)
-
-        class ThrottledMistralAIEmbeddings(MistralAIEmbeddings):
-            def embed_query(self, text: str) -> list[float]:
-                _sleep_between_requests()
-                return super().embed_query(text)
-
-            def embed_documents(self, texts: list[str]) -> list[list[float]]:
-                _sleep_between_requests()
-                return super().embed_documents(texts)
-
-            async def aembed_query(self, text: str) -> list[float]:
-                await _async_sleep_between_requests()
-                return await super().aembed_query(text)
-
-            async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
-                await _async_sleep_between_requests()
-                return await super().aembed_documents(texts)
-
-        # Les versions de `langchain-mistralai` varient légèrement sur les noms d'arguments.
-        try:
-            llm_model = ThrottledChatMistralAI(
-                model=MODEL_NAME,
-                temperature=0.0,
-                api_key=MISTRAL_API_KEY,
-            )
-        except TypeError:
-            llm_model = ThrottledChatMistralAI(
-                model=MODEL_NAME,
-                temperature=0.0,
-                mistral_api_key=MISTRAL_API_KEY,
-            )
-
-        try:
-            embed_model = ThrottledMistralAIEmbeddings(
-                model="mistral-embed",
-                api_key=MISTRAL_API_KEY,
-            )
-        except TypeError:
-            embed_model = ThrottledMistralAIEmbeddings(
-                model="mistral-embed",
-                mistral_api_key=MISTRAL_API_KEY,
-            )
-
-        # Sanity check embeddings : évite les NaN silencieux plus tard dans RAGAS.
-        try:
-            if hasattr(embed_model, "embed_query"):
-                vec = embed_model.embed_query("hello")
-            elif hasattr(embed_model, "embed_documents"):
-                vec = embed_model.embed_documents(["hello"])[0]
-            else:
-                raise RuntimeError("Le modèle d'embeddings ne fournit pas de méthode de test.")
-            if not isinstance(vec, list) or len(vec) == 0:
-                raise RuntimeError("Vecteur d'embedding invalide retourné par MistralAIEmbeddings.")
-        except Exception as exc:
-            raise RuntimeError(
-                "Échec du sanity check embeddings avant RAGAS. "
-                "Vérifie la configuration Mistral et les dépendances."
-            ) from exc
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            llm = LangchainLLMWrapper(llm_model)
-            embeddings = LangchainEmbeddingsWrapper(embed_model)
-        return llm, embeddings
     except Exception as exc:
         raise RuntimeError(
-            "Impossible de configurer RAGAS avec Mistral. "
-            "Installe `langchain-mistralai` et vérifie que MISTRAL_API_KEY est défini. "
-            "Aucun fallback OpenAI n'est autorisé sur ce projet."
+            "Impossible de charger les wrappers RAGAS Mistral. "
+            "Installe les dépendances `ragas` et `langchain-mistralai`."
         ) from exc
+
+    class SafeChatMistralAI(ChatMistralAI):
+        def _combine_llm_outputs(self, llm_outputs: list[dict | None]) -> dict:
+            overall_token_usage: dict[str, Any] = {}
+            for output in llm_outputs:
+                if not output:
+                    continue
+                token_usage = output.get("token_usage")
+                if not token_usage:
+                    continue
+                for key, value in token_usage.items():
+                    if isinstance(value, (int, float)):
+                        overall_token_usage[key] = overall_token_usage.get(key, 0) + value
+                        continue
+                    if isinstance(value, dict):
+                        previous = overall_token_usage.get(key, {})
+                        if not isinstance(previous, dict):
+                            previous = {}
+                        merged = dict(previous)
+                        for sub_key, sub_value in value.items():
+                            if isinstance(sub_value, (int, float)):
+                                merged[sub_key] = merged.get(sub_key, 0) + sub_value
+                            else:
+                                merged[sub_key] = sub_value
+                        overall_token_usage[key] = merged
+                        continue
+                    overall_token_usage[key] = value
+            return {"token_usage": overall_token_usage, "model_name": self.model}
+
+    class ThrottledChatMistralAI(SafeChatMistralAI):
+        def _generate(self, *args: Any, **kwargs: Any) -> Any:
+            _sleep_between_requests()
+            return super()._generate(*args, **kwargs)
+
+        async def _agenerate(self, *args: Any, **kwargs: Any) -> Any:
+            await _async_sleep_between_requests()
+            return await super()._agenerate(*args, **kwargs)
+
+    class ThrottledMistralAIEmbeddings(MistralAIEmbeddings):
+        def embed_query(self, text: str) -> list[float]:
+            _sleep_between_requests()
+            return super().embed_query(text)
+
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            _sleep_between_requests()
+            return super().embed_documents(texts)
+
+        async def aembed_query(self, text: str) -> list[float]:
+            await _async_sleep_between_requests()
+            return await super().aembed_query(text)
+
+        async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+            await _async_sleep_between_requests()
+            return await super().aembed_documents(texts)
+
+    try:
+        llm_model = ThrottledChatMistralAI(
+            model=SETTINGS.model_name,
+            temperature=0.0,
+            api_key=SETTINGS.mistral_api_key,
+        )
+    except TypeError:
+        llm_model = ThrottledChatMistralAI(
+            model=SETTINGS.model_name,
+            temperature=0.0,
+            mistral_api_key=SETTINGS.mistral_api_key,
+        )
+
+    try:
+        embed_model = ThrottledMistralAIEmbeddings(
+            model=SETTINGS.embedding_model,
+            api_key=SETTINGS.mistral_api_key,
+        )
+    except TypeError:
+        embed_model = ThrottledMistralAIEmbeddings(
+            model=SETTINGS.embedding_model,
+            mistral_api_key=SETTINGS.mistral_api_key,
+        )
+
+    try:
+        sanity_vec = embed_model.embed_query("hello")
+        if not isinstance(sanity_vec, list) or len(sanity_vec) == 0:
+            raise RuntimeError("Sanity check embeddings invalide.")
+    except Exception as exc:
+        raise RuntimeError("Echec du sanity check embeddings.") from exc
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        llm = LangchainLLMWrapper(llm_model)
+        embeddings = LangchainEmbeddingsWrapper(embed_model)
+
+    return llm, embeddings
+
+
+def _resolve_ragas_metrics(llm: Any, embeddings: Any) -> tuple[Any, list[Any], list[str]]:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        from ragas import evaluate
+        from ragas.metrics import AnswerRelevancy, ContextPrecision, ContextRecall, Faithfulness
+
+        metrics: list[Any] = [
+            AnswerRelevancy(llm=llm, embeddings=embeddings),
+            Faithfulness(llm=llm),
+            ContextPrecision(llm=llm),
+        ]
+        if INCLUDE_CONTEXT_RECALL:
+            metrics.append(ContextRecall(llm=llm))
+
+    metric_names = [getattr(metric, "name", metric.__class__.__name__) for metric in metrics]
+    return evaluate, metrics, metric_names
 
 
 def _run_ragas(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], pd.DataFrame]:
-    """Exécute RAGAS sur les échantillons et enrichit les sorties.
-
-    Args:
-        samples: Les échantillons à évaluer.
-
-    Returns:
-        tuple[dict[str, Any], pd.DataFrame]: Le résumé global des métriques et
-        le détail par échantillon.
-
-    Raises:
-        RuntimeError: Si le nombre de lignes détaillées ne correspond pas au
-            nombre d'échantillons évalués.
-    """
     from datasets import Dataset
     from ragas.run_config import RunConfig
 
-    payload = {
-        "question": [s["question"] for s in samples],
-        "answer": [s["answer"] for s in samples],
-        "contexts": [s["contexts"] for s in samples],
-        "ground_truth": [s["ground_truth"] for s in samples],
-    }
-    dataset = Dataset.from_dict(payload)
-    llm, embeddings = _resolve_ragas_models()
-    evaluate, metrics, activated_ragas_metric_names = _resolve_ragas_metrics(
-        llm=llm,
-        embeddings=embeddings,
+    dataset = Dataset.from_dict(
+        {
+            "question": [sample["question"] for sample in samples],
+            "answer": [sample["answer"] for sample in samples],
+            "contexts": [sample["contexts"] for sample in samples],
+            "ground_truth": [sample["ground_truth"] for sample in samples],
+        }
     )
 
+    llm, embeddings = _resolve_ragas_models()
+    evaluate_fn, metrics, metric_names = _resolve_ragas_metrics(llm, embeddings)
+
     run_config = RunConfig(
-        timeout=RAGAS_TIMEOUT,
+        timeout=RAGAS_TIMEOUT_SECONDS,
         max_retries=RAGAS_MAX_RETRIES,
-        max_wait=RAGAS_MAX_WAIT,
+        max_wait=RAGAS_MAX_WAIT_SECONDS,
         max_workers=RAGAS_MAX_WORKERS,
     )
 
-    with _logfire_span("run_ragas", samples_count=len(samples), metrics=activated_ragas_metric_names):
-        result = evaluate(
+    with logfire_span("run_ragas", sample_count=len(samples), metrics=metric_names):
+        result = evaluate_fn(
             dataset=dataset,
             metrics=metrics,
             llm=llm,
@@ -1409,20 +838,17 @@ def _run_ragas(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], pd.DataFr
         )
 
     if hasattr(result, "to_dict"):
-        summary = result.to_dict()
+        summary: dict[str, Any] = result.to_dict()
     elif isinstance(result, dict):
         summary = result
     else:
         summary = {"result_repr": str(result)}
 
-    if hasattr(result, "to_pandas"):
-        details = result.to_pandas()
-    else:
-        details = pd.DataFrame()
+    details = result.to_pandas() if hasattr(result, "to_pandas") else pd.DataFrame()
 
-    sample_indexes = [s["sample_index"] for s in samples]
-    ids = [s["id"] for s in samples]
-    categories = [s["category"] for s in samples]
+    sample_indexes = [sample["sample_index"] for sample in samples]
+    ids = [sample["id"] for sample in samples]
+    categories = [sample["category"] for sample in samples]
 
     if details.empty:
         details = pd.DataFrame({"sample_index": sample_indexes, "id": ids, "category": categories})
@@ -1438,10 +864,7 @@ def _run_ragas(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], pd.DataFr
             f"Nombre de lignes détaillées incohérent ({len(details)}) pour {len(samples)} questions."
         )
 
-    additional_df = _build_additional_metrics_dataframe(
-        samples=samples,
-        overlap_threshold=RETRIEVAL_OVERLAP_THRESHOLD,
-    )
+    additional_df = _build_additional_metrics_dataframe(samples)
     if not additional_df.empty:
         details = details.merge(
             additional_df,
@@ -1449,21 +872,20 @@ def _run_ragas(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], pd.DataFr
             how="left",
             validate="one_to_one",
         )
-
-        for col in additional_df.columns:
-            if col in {"sample_index", "id"}:
+        for column in additional_df.columns:
+            if column in {"sample_index", "id"}:
                 continue
-            if pd.api.types.is_numeric_dtype(additional_df[col]):
-                series = additional_df[col].dropna()
-                summary[f"mean_{col}"] = float(series.mean()) if not series.empty else None
+            if pd.api.types.is_numeric_dtype(additional_df[column]):
+                values = additional_df[column].dropna()
+                summary[f"mean_{column}"] = float(values.mean()) if not values.empty else None
 
-    summary["activated_ragas_metrics"] = activated_ragas_metric_names
+    summary["activated_ragas_metrics"] = metric_names
     summary["metrics_profile"] = "core"
     summary["ragas_run_config"] = {
         "max_workers": RAGAS_MAX_WORKERS,
         "max_retries": RAGAS_MAX_RETRIES,
-        "max_wait": RAGAS_MAX_WAIT,
-        "timeout": RAGAS_TIMEOUT,
+        "max_wait": RAGAS_MAX_WAIT_SECONDS,
+        "timeout": RAGAS_TIMEOUT_SECONDS,
         "batch_size": RAGAS_BATCH_SIZE,
         "strict_ragas_errors": STRICT_RAGAS_ERRORS,
     }
@@ -1479,51 +901,41 @@ def _run_ragas(samples: list[dict[str, Any]]) -> tuple[dict[str, Any], pd.DataFr
     return summary, details
 
 
-def _save_outputs(
-    *,
-    output_dir: Path,
-    samples: list[dict[str, Any]],
-    summary: dict[str, Any] | None,
-    details: pd.DataFrame | None,
-) -> None:
-    """Sauvegarde les échantillons et les résultats d'évaluation sur disque.
+def _save_outputs(*, samples: list[dict[str, Any]], summary: dict[str, Any] | None, details: pd.DataFrame | None) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    Args:
-        output_dir: Le répertoire de sortie.
-        samples: Les échantillons générés.
-        summary: Le résumé global des métriques, si disponible.
-        details: Le détail par échantillon, si disponible.
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    samples_path = output_dir / f"samples_{ts}.json"
+    samples_path = OUTPUT_DIR / f"samples_{timestamp}.json"
     samples_path.write_text(json.dumps(samples, indent=2, ensure_ascii=False), encoding="utf-8")
 
     if summary is not None:
-        summary_path = output_dir / f"ragas_summary_{ts}.json"
+        summary_path = OUTPUT_DIR / f"ragas_summary_{timestamp}.json"
         summary_path.write_text(
             json.dumps(summary, indent=2, ensure_ascii=False, default=str),
             encoding="utf-8",
         )
 
     if details is not None and not details.empty:
-        details_path = output_dir / f"ragas_details_{ts}.csv"
+        details_path = OUTPUT_DIR / f"ragas_details_{timestamp}.csv"
         details.to_csv(details_path, index=False)
 
 
+def _configure_observability() -> None:
+    configure_logfire(
+        enabled=SETTINGS.logfire_enabled,
+        send_to_logfire=SETTINGS.logfire_send_to_logfire,
+        service_name=SETTINGS.logfire_service_name,
+        logger=LOGGER,
+        instrument_pydantic=True,
+    )
+
+
 def main() -> None:
-    """Orchestre le pipeline complet d'évaluation RAGAS.
-
-    Raises:
-        EnvironmentError: Si la clé API Mistral est absente.
-        RuntimeError: Si l'index vectoriel est absent ou si l'évaluation échoue.
-    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    _configure_logfire()
+    _configure_observability()
 
-    if not MISTRAL_API_KEY:
-        raise EnvironmentError("MISTRAL_API_KEY est absent du fichier .env")
+    if not SETTINGS.mistral_api_key:
+        raise EnvironmentError("MISTRAL_API_KEY est absent de l'environnement.")
 
     retriever = VectorStoreManager()
     if retriever.index is None or not retriever.document_chunks:
@@ -1531,50 +943,28 @@ def main() -> None:
 
     questions = _load_questions()
     LOGGER.info("Questions chargées : %s", len(questions))
-    client = Mistral(api_key=MISTRAL_API_KEY)
 
-    samples = _build_samples(
-        questions=questions,
-        retriever=retriever,
-        client=client,
-        model=EVAL_MODEL,
-        k=EVAL_K,
-        min_score=EVAL_MIN_SCORE,
-    )
-    LOGGER.info("Échantillons générés : %s", len(samples))
-
-    output_dir = Path(OUTPUT_DIR)
-
-    if SKIP_RAGAS:
-        _save_outputs(output_dir=output_dir, samples=samples, summary=None, details=None)
-        LOGGER.info("Exécution terminée (échantillons uniquement, RAGAS ignoré).")
-        return
-
-    if not INCLUDE_CONTEXT_RECALL:
-        LOGGER.info(
-            "context_recall est désactivé dans la configuration du script."
-        )
+    client = Mistral(api_key=SETTINGS.mistral_api_key)
+    samples = _build_samples(questions=questions, retriever=retriever, client=client)
+    LOGGER.info("Echantillons générés : %s", len(samples))
 
     try:
         LOGGER.info(
-            "Lancement RAGAS (profile=core), workers=%s, batch_size=%s, strict_errors=%s",
+            "Lancement RAGAS core: workers=%s, batch_size=%s, strict_errors=%s",
             RAGAS_MAX_WORKERS,
             RAGAS_BATCH_SIZE,
             STRICT_RAGAS_ERRORS,
         )
         summary, details = _run_ragas(samples)
     except Exception as exc:
-        _save_outputs(output_dir=output_dir, samples=samples, summary=None, details=None)
-        LOGGER.error("Échec de l'évaluation RAGAS : %s", exc)
-        LOGGER.error(
-            "Les échantillons ont été sauvegardés. Tu peux passer SKIP_RAGAS=True dans le script pendant la correction."
-        )
+        _save_outputs(samples=samples, summary=None, details=None)
+        LOGGER.error("Echec de l'évaluation RAGAS : %s", exc)
+        LOGGER.error("Les échantillons ont été sauvegardés pour diagnostic.")
         raise
 
-    _save_outputs(output_dir=output_dir, samples=samples, summary=summary, details=details)
+    _save_outputs(samples=samples, summary=summary, details=details)
 
     LOGGER.info("Résumé RAGAS : %s", summary)
-    LOGGER.info("Questions évaluées : %s", len(samples))
     if not details.empty:
         metric_cols = [
             "answer_relevancy",
@@ -1589,10 +979,9 @@ def main() -> None:
             "latency_generation_s",
             "latency_total_s",
         ]
-        metric_cols = [col for col in metric_cols if col in details.columns]
+        metric_cols = [column for column in metric_cols if column in details.columns]
         if metric_cols:
-            missing_ratio = details[metric_cols].isna().mean().to_dict()
-            LOGGER.info("Taux de valeurs manquantes par métrique : %s", missing_ratio)
+            LOGGER.info("Taux de valeurs manquantes : %s", details[metric_cols].isna().mean().to_dict())
         LOGGER.info("Nombre de lignes détaillées : %s", len(details))
 
 

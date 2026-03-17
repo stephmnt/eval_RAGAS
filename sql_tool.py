@@ -1,10 +1,4 @@
-"""Tool SQL minimal pour questions chiffrées NBA.
-
-Fonctions principales:
-- génération dynamique SQL (LLM Mistral + few-shot)
-- exécution SQL en lecture seule
-- exposition d'un Tool LangChain et d'une fonction simple pour l'app
-"""
+"""Tool SQL minimal pour questions chiffrées NBA."""
 
 from __future__ import annotations
 
@@ -15,14 +9,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.tools import StructuredTool
-from langchain_mistralai import ChatMistralAI
-from mistralai import Mistral
+from utils.config import get_settings
 
-from utils.config import DATABASE_FILE, MISTRAL_API_KEY, MODEL_NAME
-
-DB_PATH = Path(DATABASE_FILE)
+SETTINGS = get_settings()
+DB_PATH = Path(SETTINGS.database_file)
 MAX_ROWS = 30
 
 SQL_FEW_SHOTS = """
@@ -44,12 +34,6 @@ ORDER BY team_points_total DESC;
 Q: Compare les rebonds domicile vs extérieur.
 SQL:
 SELECT 'Limite: la base ne contient pas de split domicile/extérieur.' AS message;
-
-Q: Quelle est la moyenne des assists des joueurs de BOS ?
-SQL:
-SELECT AVG(assists) AS avg_assists
-FROM players
-WHERE team_code = 'BOS';
 """.strip()
 
 
@@ -72,38 +56,9 @@ def is_likely_quant_question(question: str) -> bool:
     return any(token in lowered for token in keywords) or bool(re.search(r"\d", question))
 
 
-def llm_should_use_sql(question: str) -> bool:
-    """Décision minimale par LLM: faut-il router vers le Tool SQL ?"""
-    if not MISTRAL_API_KEY:
-        return is_likely_quant_question(question)
-    try:
-        client = Mistral(api_key=MISTRAL_API_KEY)
-        response = client.chat.complete(
-            model=MODEL_NAME,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Tu es un routeur. Reponds uniquement par YES ou NO. "
-                        "YES si la question demande une réponse chiffrée ou une aggrégation SQL."
-                    ),
-                },
-                {"role": "user", "content": question},
-            ],
-            temperature=0.0,
-        )
-        verdict = (response.choices[0].message.content or "").strip().upper()
-        return verdict.startswith("YES")
-    except Exception:
-        return is_likely_quant_question(question)
-
-
 def _extract_sql(text: str) -> str:
     block_match = re.search(r"```sql\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
-    if block_match:
-        candidate = block_match.group(1).strip()
-    else:
-        candidate = text.strip()
+    candidate = block_match.group(1).strip() if block_match else text.strip()
     candidate = candidate.strip("`").strip()
     if not candidate.endswith(";"):
         candidate += ";"
@@ -139,9 +94,11 @@ def _schema_as_text(conn: sqlite3.Connection) -> str:
 
 class NBASQLTool:
     def __init__(self) -> None:
-        if not MISTRAL_API_KEY:
+        if not SETTINGS.mistral_api_key:
             raise EnvironmentError("MISTRAL_API_KEY est requis pour le Tool SQL.")
-        self.client = Mistral(api_key=MISTRAL_API_KEY)
+        from mistralai import Mistral
+
+        self.client = Mistral(api_key=SETTINGS.mistral_api_key)
 
     def _build_prompt(self, question: str, schema: str) -> str:
         return (
@@ -150,7 +107,7 @@ class NBASQLTool:
             "Contraintes:\n"
             "- Autorise uniquement SELECT / WITH ... SELECT\n"
             "- Utilise uniquement les tables et colonnes du schéma\n"
-            "- Si la question demande une dimension absente (ex: domicile/extérieur), renvoie une requête SELECT avec message explicite\n"
+            "- Si la question demande une dimension absente, renvoie un SELECT avec message explicite\n"
             "- Réponds uniquement avec SQL\n\n"
             f"Schema:\n{schema}\n\n"
             f"Few-shot:\n{SQL_FEW_SHOTS}\n\n"
@@ -161,23 +118,17 @@ class NBASQLTool:
     def _generate_sql(self, question: str, schema: str) -> str:
         prompt = self._build_prompt(question=question, schema=schema)
         response = self.client.chat.complete(
-            model=MODEL_NAME,
+            model=SETTINGS.model_name,
             messages=[
-                {"role": "system", "content": "Tu ecris uniquement des requetes SQL SQLite."},
+                {"role": "system", "content": "Tu écris uniquement des requêtes SQL SQLite."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.0,
         )
-        content = response.choices[0].message.content or ""
-        sql = _extract_sql(content)
+        sql = _extract_sql(response.choices[0].message.content or "")
         if not _is_safe_sql(sql):
-            raise ValueError(f"SQL non securisé ou invalide: {sql}")
+            raise ValueError(f"SQL non sécurisé ou invalide: {sql}")
         return sql
-
-    def _execute_sql(self, conn: sqlite3.Connection, sql: str) -> list[dict[str, Any]]:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(sql).fetchmany(MAX_ROWS)
-        return [dict(row) for row in rows]
 
     def answer(self, question: str) -> dict[str, Any]:
         if not DB_PATH.exists():
@@ -189,9 +140,10 @@ class NBASQLTool:
             }
 
         with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
             schema = _schema_as_text(conn)
             sql = self._generate_sql(question=question, schema=schema)
-            rows = self._execute_sql(conn, sql)
+            rows = [dict(row) for row in conn.execute(sql).fetchmany(MAX_ROWS)]
 
         return {
             "status": "ok",
@@ -201,54 +153,50 @@ class NBASQLTool:
         }
 
     def run(self, question: str) -> str:
-        result = self.answer(question)
-        return json.dumps(result, ensure_ascii=False)
+        return json.dumps(self.answer(question), ensure_ascii=False)
 
 
-_SQL_AGENT: NBASQLTool | None = None
-
-
+@lru_cache(maxsize=1)
 def _get_agent() -> NBASQLTool:
-    global _SQL_AGENT
-    if _SQL_AGENT is None:
-        _SQL_AGENT = NBASQLTool()
-    return _SQL_AGENT
-
-
-def answer_question_sql(question: str) -> dict[str, Any]:
-    return _get_agent().answer(question)
+    return NBASQLTool()
 
 
 @lru_cache(maxsize=1)
 def _get_routing_llm() -> ChatMistralAI:
-    if not MISTRAL_API_KEY:
-        raise EnvironmentError("MISTRAL_API_KEY est requis pour le routage LangChain.")
+    from langchain_mistralai import ChatMistralAI
+
+    if not SETTINGS.mistral_api_key:
+        raise EnvironmentError("MISTRAL_API_KEY est requis pour le routage SQL.")
     try:
         return ChatMistralAI(
-            model=MODEL_NAME,
+            model=SETTINGS.model_name,
             temperature=0.0,
-            api_key=MISTRAL_API_KEY,
+            api_key=SETTINGS.mistral_api_key,
         )
     except TypeError:
         return ChatMistralAI(
-            model=MODEL_NAME,
+            model=SETTINGS.model_name,
             temperature=0.0,
-            mistral_api_key=MISTRAL_API_KEY,
+            mistral_api_key=SETTINGS.mistral_api_key,
         )
 
 
 @lru_cache(maxsize=1)
-def _get_structured_sql_tool() -> StructuredTool:
-    return build_sql_tool()
+def _get_sql_tool() -> StructuredTool:
+    from langchain_core.tools import StructuredTool
+
+    return StructuredTool.from_function(
+        func=_get_agent().run,
+        name="nba_sql_tool",
+        description=(
+            "Interroge la base SQL NBA (players, matches, stats, reports) "
+            "pour les questions chiffrées (totaux, moyennes, comparaisons)."
+        ),
+    )
 
 
 def answer_question_sql_via_langchain(question: str) -> dict[str, Any]:
-    """Route et exécute le tool SQL via un flux LangChain tool-calling.
-
-    Returns:
-        dict[str, Any]: Payload unifié contenant status/sql/rows/message.
-            status peut valoir `ok`, `no_tool` ou `error`.
-    """
+    """Flux public unique: route et exécute le Tool SQL."""
     trimmed = question.strip()
     if not trimmed:
         return {
@@ -258,26 +206,30 @@ def answer_question_sql_via_langchain(question: str) -> dict[str, Any]:
             "message": "Question vide, aucun appel SQL.",
         }
 
-    # Fallback minimal si les dépendances LangChain/clé API ne sont pas disponibles.
-    if not MISTRAL_API_KEY:
-        if not is_likely_quant_question(trimmed):
-            return {
-                "status": "no_tool",
-                "sql": None,
-                "rows": [],
-                "message": "Aucun appel SQL nécessaire.",
-            }
-        return answer_question_sql(trimmed)
+    if not SETTINGS.mistral_api_key:
+        return {
+            "status": "no_tool",
+            "sql": None,
+            "rows": [],
+            "message": "MISTRAL_API_KEY manquant, SQL tool indisponible.",
+        }
 
-    tool = _get_structured_sql_tool()
-    llm = _get_routing_llm().bind_tools([tool])
+    if not is_likely_quant_question(trimmed):
+        return {
+            "status": "no_tool",
+            "sql": None,
+            "rows": [],
+            "message": "Aucun appel SQL jugé utile.",
+        }
+
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    llm = _get_routing_llm().bind_tools([_get_sql_tool()])
     messages = [
         SystemMessage(
             content=(
                 "Tu réponds aux questions NBA. "
-                "Appelle l'outil `nba_sql_tool` uniquement si la question "
-                "nécessite une réponse chiffrée, une comparaison numérique, "
-                "un classement ou une agrégation."
+                "Appelle `nba_sql_tool` uniquement pour les besoins chiffrés."
             )
         ),
         HumanMessage(content=trimmed),
@@ -286,19 +238,17 @@ def answer_question_sql_via_langchain(question: str) -> dict[str, Any]:
     try:
         ai_message = llm.invoke(messages)
         tool_calls = getattr(ai_message, "tool_calls", None) or []
-
         if not tool_calls:
             return {
                 "status": "no_tool",
                 "sql": None,
                 "rows": [],
-                "message": "Aucun appel SQL jugé utile par le routeur outillé.",
+                "message": "Le routeur n'a pas déclenché le SQL tool.",
             }
 
         first_call = tool_calls[0]
         args = first_call.get("args", {})
-        raw_result = tool.invoke(args if isinstance(args, dict) else {"question": trimmed})
-
+        raw_result = _get_sql_tool().invoke(args if isinstance(args, dict) else {"question": trimmed})
         if isinstance(raw_result, str):
             result = json.loads(raw_result)
         elif isinstance(raw_result, dict):
@@ -321,16 +271,5 @@ def answer_question_sql_via_langchain(question: str) -> dict[str, Any]:
             "status": "error",
             "sql": None,
             "rows": [],
-            "message": f"Echec du flux LangChain SQL: {exc}",
+            "message": f"Echec du flux SQL: {exc}",
         }
-
-
-def build_sql_tool() -> StructuredTool:
-    return StructuredTool.from_function(
-        func=_get_agent().run,
-        name="nba_sql_tool",
-        description=(
-            "Interroge la base SQL NBA (players, matches, stats, reports) "
-            "pour repondre aux questions chiffrées (totaux, moyennes, comparaisons)."
-        ),
-    )

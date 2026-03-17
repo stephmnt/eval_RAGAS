@@ -1,37 +1,36 @@
-# utils/vector_store.py
 import os
 import pickle
+import logging
+from typing import Any, Dict, List, Optional
+
 import faiss
 import numpy as np
-import logging
-from typing import List, Dict, Tuple, Optional
-from mistralai import Mistral
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document # Utilisé pour le format attendu par le splitter
-from .config import (
-    MISTRAL_API_KEY, EMBEDDING_MODEL, EMBEDDING_BATCH_SIZE,
-    FAISS_INDEX_FILE, DOCUMENT_CHUNKS_FILE, CHUNK_SIZE, CHUNK_OVERLAP
-)
+from mistralai import Mistral
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from .config import get_settings
+
+SETTINGS = get_settings()
+LOGGER = logging.getLogger(__name__)
 
 class VectorStoreManager:
     """Gère la création, le chargement et la recherche dans un index Faiss."""
 
     def __init__(self):
         self.index: Optional[faiss.Index] = None
-        self.document_chunks: List[Dict[str, any]] = [] # type: ignore
-        self.mistral_client = Mistral(api_key=MISTRAL_API_KEY)
+        self.document_chunks: List[Dict[str, Any]] = []
+        self.mistral_client = Mistral(api_key=SETTINGS.mistral_api_key)
         self._load_index_and_chunks()
 
     def _load_index_and_chunks(self):
         """Charge l'index Faiss et les chunks si les fichiers existent."""
-        if os.path.exists(FAISS_INDEX_FILE) and os.path.exists(DOCUMENT_CHUNKS_FILE):
+        if os.path.exists(SETTINGS.faiss_index_file) and os.path.exists(SETTINGS.document_chunks_file):
             try:
-                logging.info(f"Chargement de l'index Faiss depuis {FAISS_INDEX_FILE}...")
-                self.index = faiss.read_index(FAISS_INDEX_FILE)
-                logging.info(f"Chargement des chunks depuis {DOCUMENT_CHUNKS_FILE}...")
-                with open(DOCUMENT_CHUNKS_FILE, 'rb') as f:
+                logging.info(f"Chargement de l'index Faiss depuis {SETTINGS.faiss_index_file}...")
+                self.index = faiss.read_index(SETTINGS.faiss_index_file)
+                logging.info(f"Chargement des chunks depuis {SETTINGS.document_chunks_file}...")
+                with open(SETTINGS.document_chunks_file, 'rb') as f:
                     self.document_chunks = pickle.load(f)
                 logging.info(f"Index ({self.index.ntotal} vecteurs) et {len(self.document_chunks)} chunks chargés.")
             except Exception as e:
@@ -41,12 +40,15 @@ class VectorStoreManager:
         else:
             logging.warning("Fichiers d'index Faiss ou de chunks non trouvés. L'index est vide.")
 
-    def _split_documents_to_chunks(self, documents: List[Dict[str, any]]) -> List[Dict[str, any]]:
+    def _split_documents_to_chunks(self, documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Découpe les documents en chunks avec métadonnées."""
-        logging.info(f"Découpage de {len(documents)} documents en chunks (taille={CHUNK_SIZE}, chevauchement={CHUNK_OVERLAP})...")
+        logging.info(
+            f"Découpage de {len(documents)} documents en chunks "
+            f"(taille={SETTINGS.chunk_size}, chevauchement={SETTINGS.chunk_overlap})..."
+        )
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
+            chunk_size=SETTINGS.chunk_size,
+            chunk_overlap=SETTINGS.chunk_overlap,
             length_function=len, # Important: mesure en caractères
             add_start_index=True, # Ajoute la position de début du chunk dans le document original
         )
@@ -76,28 +78,30 @@ class VectorStoreManager:
         logging.info(f"Total de {len(all_chunks)} chunks créés.")
         return all_chunks
 
-    def _generate_embeddings(self, chunks: List[Dict[str, any]]) -> Optional[np.ndarray]:
+    def _generate_embeddings(self, chunks: List[Dict[str, Any]]) -> Optional[np.ndarray]:
         """Génère les embeddings pour une liste de chunks via l'API Mistral."""
-        if not MISTRAL_API_KEY:
+        if not SETTINGS.mistral_api_key:
             logging.error("Impossible de générer les embeddings: MISTRAL_API_KEY manquante.")
             return None
         if not chunks:
             logging.warning("Aucun chunk fourni pour générer les embeddings.")
             return None
 
-        logging.info(f"Génération des embeddings pour {len(chunks)} chunks (modèle: {EMBEDDING_MODEL})...")
+        logging.info(
+            f"Génération des embeddings pour {len(chunks)} chunks (modèle: {SETTINGS.embedding_model})..."
+        )
         all_embeddings = []
-        total_batches = (len(chunks) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE
+        total_batches = (len(chunks) + SETTINGS.embedding_batch_size - 1) // SETTINGS.embedding_batch_size
 
-        for i in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
-            batch_num = (i // EMBEDDING_BATCH_SIZE) + 1
-            batch_chunks = chunks[i:i + EMBEDDING_BATCH_SIZE]
+        for i in range(0, len(chunks), SETTINGS.embedding_batch_size):
+            batch_num = (i // SETTINGS.embedding_batch_size) + 1
+            batch_chunks = chunks[i:i + SETTINGS.embedding_batch_size]
             texts_to_embed = [chunk["text"] for chunk in batch_chunks]
 
             logging.info(f"  Traitement du lot {batch_num}/{total_batches} ({len(texts_to_embed)} chunks)")
             try:
                 response = self.mistral_client.embeddings.create(
-                    model=EMBEDDING_MODEL,
+                    model=SETTINGS.embedding_model,
                     inputs=texts_to_embed
                 )
                 batch_embeddings = [data.embedding for data in response.data]
@@ -122,7 +126,7 @@ class VectorStoreManager:
         logging.info(f"Embeddings générés avec succès. Shape: {embeddings_array.shape}")
         return embeddings_array
 
-    def build_index(self, documents: List[Dict[str, any]]):
+    def build_index(self, documents: List[Dict[str, Any]]):
         """Construit l'index Faiss à partir des documents."""
         if not documents:
             logging.warning("Aucun document fourni pour construire l'index.")
@@ -142,8 +146,8 @@ class VectorStoreManager:
             self.document_chunks = []
             self.index = None
             # Supprimer les fichiers potentiellement corrompus
-            if os.path.exists(FAISS_INDEX_FILE): os.remove(FAISS_INDEX_FILE)
-            if os.path.exists(DOCUMENT_CHUNKS_FILE): os.remove(DOCUMENT_CHUNKS_FILE)
+            if os.path.exists(SETTINGS.faiss_index_file): os.remove(SETTINGS.faiss_index_file)
+            if os.path.exists(SETTINGS.document_chunks_file): os.remove(SETTINGS.document_chunks_file)
             return
 
 
@@ -168,20 +172,20 @@ class VectorStoreManager:
             logging.warning("Tentative de sauvegarde d'un index ou de chunks vides.")
             return
 
-        os.makedirs(os.path.dirname(FAISS_INDEX_FILE), exist_ok=True)
-        os.makedirs(os.path.dirname(DOCUMENT_CHUNKS_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(SETTINGS.faiss_index_file), exist_ok=True)
+        os.makedirs(os.path.dirname(SETTINGS.document_chunks_file), exist_ok=True)
 
         try:
-            logging.info(f"Sauvegarde de l'index Faiss dans {FAISS_INDEX_FILE}...")
-            faiss.write_index(self.index, FAISS_INDEX_FILE)
-            logging.info(f"Sauvegarde des chunks dans {DOCUMENT_CHUNKS_FILE}...")
-            with open(DOCUMENT_CHUNKS_FILE, 'wb') as f:
+            logging.info(f"Sauvegarde de l'index Faiss dans {SETTINGS.faiss_index_file}...")
+            faiss.write_index(self.index, SETTINGS.faiss_index_file)
+            logging.info(f"Sauvegarde des chunks dans {SETTINGS.document_chunks_file}...")
+            with open(SETTINGS.document_chunks_file, 'wb') as f:
                 pickle.dump(self.document_chunks, f)
             logging.info("Index et chunks sauvegardés avec succès.")
         except Exception as e:
             logging.error(f"Erreur lors de la sauvegarde de l'index/chunks: {e}")
 
-    def search(self, query_text: str, k: int = 5, min_score: float = None) -> List[Dict[str, any]]:
+    def search(self, query_text: str, k: int = 5, min_score: float | None = None) -> List[Dict[str, Any]]:
         """
         Recherche les k chunks les plus pertinents pour une requête.
 
@@ -196,7 +200,7 @@ class VectorStoreManager:
         if self.index is None or not self.document_chunks:
             logging.warning("Recherche impossible: l'index Faiss n'est pas chargé ou est vide.")
             return []
-        if not MISTRAL_API_KEY:
+        if not SETTINGS.mistral_api_key:
              logging.error("Recherche impossible: MISTRAL_API_KEY manquante pour générer l'embedding de la requête.")
              return []
 
@@ -204,7 +208,7 @@ class VectorStoreManager:
         try:
             # 1. Générer l'embedding de la requête
             response = self.mistral_client.embeddings.create(
-                model=EMBEDDING_MODEL,
+                model=SETTINGS.embedding_model,
                 inputs=[query_text] # La requête doit être une liste
             )
             query_embedding = np.array([response.data[0].embedding]).astype('float32')
