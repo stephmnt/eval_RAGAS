@@ -31,18 +31,15 @@ flowchart TD
     U[Utilisateur] -->|Question| S[Streamlit MistralChat.py]
     U -->|HTTP JSON| A[FastAPI api.py]
 
-    S --> R[Retriever FAISS utils/vector_store.py]
-    A --> R
+    S --> G[Service partagé RAGService api.py]
+    A --> G
 
-    S --> T[Tool SQL sql_tool.py]
-    A --> T
+    G --> R[Retriever FAISS utils/vector_store.py]
+    G --> T[Tool SQL sql_tool.py]
+    G --> M[Mistral API]
 
     R --> V[(vector_db/faiss_index.idx + document_chunks.pkl)]
     T --> D[(database/nba_data.db)]
-
-    S --> M[Mistral API]
-    A --> M
-    T --> M
 
     I[indexer.py] --> V
     L[load_excel_to_db.py] --> D
@@ -106,11 +103,11 @@ Données attendues (selon mission) :
 
 ### `MistralChat.py`
 - Interface Streamlit.
-- Pipeline RAG + SQL pour répondre aux questions utilisateurs.
+- Réutilise le service partagé `get_rag_service()` défini dans `api.py`.
 
 ### `api.py`
 - API REST FastAPI versionnée.
-- Expose le même pipeline RAG + SQL que l'app Streamlit.
+- Contient le service partagé `RAGService` utilisé à la fois par l'API et Streamlit.
 - Validation Pydantic explicite des flux internes : contextes retrieval, résultat SQL, réponse générée, sortie API.
 - Instrumentation Logfire optionnelle.
 
@@ -154,10 +151,6 @@ Docs OpenAPI :
 ### Endpoints v1 (cibles)
 - `GET /api/v1/health`
 - `POST /api/v1/ask`
-
-### Endpoints legacy (compatibilité, dépréciés)
-- `GET /health`
-- `POST /ask`
 
 ### Format requête `/api/v1/ask`
 ```json
@@ -219,7 +212,7 @@ python evaluate_ragas.py
 pytest -q
 ```
 
-Le dossier `tests/` couvre :
+Le fichier `tests.py` couvre :
 - validateurs Pydantic du flux RAG,
 - contrat principal de l’API,
 - garde-fous SQL lecture seule,
@@ -240,5 +233,7 @@ Rapport d'analyse : `notes_perso.ipynb`
 
 ## 12. Dépendances conservées / nettoyées
 - `streamlit-feedback` retiré : non utilisé dans le code versionné.
+- `python-docx` retiré : aucun flux DOCX n'est implémenté dans le repo versionné.
+- `requests` retiré : aucune requête HTTP sortante n'est utilisée dans le code versionné.
 - `langchain-openai` conservé : requis par la stack `ragas==0.4.3` (imports internes de compatibilité).
 - `langchain-community` conservé : composant de l’écosystème LangChain utilisé avec la version retenue.
