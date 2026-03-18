@@ -26,7 +26,7 @@ Modules **présents** :
 - `sql_tool.py`
 - `evaluate_ragas.py`
 - `eval_questions.json`
-- `notes_perso.ipynb`
+- `rapport_evaluation.ipynb`
 - `utils/config.py`, `utils/vector_store.py`, `utils/data_loader.py`
 
 Modules **absents** (et donc non documentés comme actifs) :
@@ -59,7 +59,7 @@ flowchart TD
     E --> M
     E --> O[(outputs/evaluations)]
 
-    N[notes_perso.ipynb] --> O
+    N[rapport_evaluation.ipynb] --> O
 ```
 
 ## 3. Prérequis
@@ -153,7 +153,7 @@ Données attendues (selon mission) :
   - `outputs/evaluations/ragas_summary_*.json`
   - `outputs/evaluations/ragas_details_*.csv`
 
-### `notes_perso.ipynb`
+### `rapport_evaluation.ipynb`
 
 - Rapport d'analyse méthodologique.
 - Inclut comparatifs avant/après et visualisations.
@@ -273,7 +273,7 @@ Artefacts d'évaluation : `outputs/evaluations/`
 - `ragas_summary_*.json`
 - `ragas_details_*.csv`
 
-Rapport d'analyse : `notes_perso.ipynb`
+Rapport d'analyse : `rapport_evaluation.ipynb`
 
 ## 11. Limites connues
 
