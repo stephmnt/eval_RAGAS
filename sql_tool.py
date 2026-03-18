@@ -37,6 +37,16 @@ SELECT 'Limite: la base ne contient pas de split domicile/extérieur.' AS messag
 """.strip()
 
 
+def _tool_result(
+    status: str,
+    message: str,
+    *,
+    sql: str | None = None,
+    rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {"status": status, "sql": sql, "rows": rows or [], "message": message}
+
+
 def is_likely_quant_question(question: str) -> bool:
     lowered = question.lower()
     keywords = [
@@ -132,12 +142,7 @@ class NBASQLTool:
 
     def answer(self, question: str) -> dict[str, Any]:
         if not DB_PATH.exists():
-            return {
-                "status": "error",
-                "sql": None,
-                "rows": [],
-                "message": f"Base absente: {DB_PATH}. Lance d'abord load_excel_to_db.py.",
-            }
+            return _tool_result("error", f"Base absente: {DB_PATH}. Lance d'abord load_excel_to_db.py.")
 
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
@@ -145,12 +150,7 @@ class NBASQLTool:
             sql = self._generate_sql(question=question, schema=schema)
             rows = [dict(row) for row in conn.execute(sql).fetchmany(MAX_ROWS)]
 
-        return {
-            "status": "ok",
-            "sql": sql,
-            "rows": rows,
-            "message": "Résultats SQL disponibles.",
-        }
+        return _tool_result("ok", "Résultats SQL disponibles.", sql=sql, rows=rows)
 
     def run(self, question: str) -> str:
         return json.dumps(self.answer(question), ensure_ascii=False)
@@ -199,28 +199,13 @@ def answer_question_sql_via_langchain(question: str) -> dict[str, Any]:
     """Flux public unique: route et exécute le Tool SQL."""
     trimmed = question.strip()
     if not trimmed:
-        return {
-            "status": "no_tool",
-            "sql": None,
-            "rows": [],
-            "message": "Question vide, aucun appel SQL.",
-        }
+        return _tool_result("no_tool", "Question vide, aucun appel SQL.")
 
     if not SETTINGS.mistral_api_key:
-        return {
-            "status": "no_tool",
-            "sql": None,
-            "rows": [],
-            "message": "MISTRAL_API_KEY manquant, SQL tool indisponible.",
-        }
+        return _tool_result("no_tool", "MISTRAL_API_KEY manquant, SQL tool indisponible.")
 
     if not is_likely_quant_question(trimmed):
-        return {
-            "status": "no_tool",
-            "sql": None,
-            "rows": [],
-            "message": "Aucun appel SQL jugé utile.",
-        }
+        return _tool_result("no_tool", "Aucun appel SQL jugé utile.")
 
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -239,12 +224,7 @@ def answer_question_sql_via_langchain(question: str) -> dict[str, Any]:
         ai_message = llm.invoke(messages)
         tool_calls = getattr(ai_message, "tool_calls", None) or []
         if not tool_calls:
-            return {
-                "status": "no_tool",
-                "sql": None,
-                "rows": [],
-                "message": "Le routeur n'a pas déclenché le SQL tool.",
-            }
+            return _tool_result("no_tool", "Le routeur n'a pas déclenché le SQL tool.")
 
         first_call = tool_calls[0]
         args = first_call.get("args", {})
@@ -254,22 +234,13 @@ def answer_question_sql_via_langchain(question: str) -> dict[str, Any]:
         elif isinstance(raw_result, dict):
             result = raw_result
         else:
-            result = {
-                "status": "error",
-                "sql": None,
-                "rows": [],
-                "message": f"Réponse tool inattendue: {type(raw_result).__name__}",
-            }
+            return _tool_result("error", f"Réponse tool inattendue: {type(raw_result).__name__}")
 
-        result.setdefault("status", "ok")
-        result.setdefault("sql", None)
-        result.setdefault("rows", [])
-        result.setdefault("message", "Résultats SQL disponibles.")
-        return result
+        return _tool_result(
+            result.get("status", "ok"),
+            result.get("message", "Résultats SQL disponibles."),
+            sql=result.get("sql"),
+            rows=result.get("rows"),
+        )
     except Exception as exc:
-        return {
-            "status": "error",
-            "sql": None,
-            "rows": [],
-            "message": f"Echec du flux SQL: {exc}",
-        }
+        return _tool_result("error", f"Echec du flux SQL: {exc}")

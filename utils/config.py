@@ -39,6 +39,8 @@ class Settings:
     database_file: str
     app_title: str
     app_name: str
+    easyocr_enabled: bool
+    easyocr_gpu: bool
     logfire_enabled: bool
     logfire_send_to_logfire: bool
     logfire_service_name: str
@@ -67,6 +69,8 @@ def get_settings() -> Settings:
         database_file=os.path.join(database_dir, "nba_data.db"),
         app_title="NBA Analyst AI",
         app_name="NBA",
+        easyocr_enabled=_env_bool("EASYOCR_ENABLED", default=False),
+        easyocr_gpu=_env_bool("EASYOCR_GPU", default=False),
         logfire_enabled=_env_bool("LOGFIRE_ENABLED", default=False),
         logfire_send_to_logfire=_env_bool("LOGFIRE_SEND_TO_LOGFIRE", default=False),
         logfire_service_name=os.getenv("LOGFIRE_SERVICE_NAME", "rag-nba"),

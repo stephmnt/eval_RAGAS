@@ -177,6 +177,115 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
+PLAYER_FIELD_MAP = (
+    ("player_name", "Player", None),
+    ("team_code", "Team", None),
+    *((field, column, _to_int) for field, column in (("age", "Age"), ("gp", "GP"), ("wins", "W"), ("losses", "L"))),
+    *(
+        (field, column, _to_float)
+        for field, column in (
+            ("minutes", "Min"),
+            ("points_total", "PTS"),
+            ("fg_pct", "FG%"),
+            ("three_pt_pct", "3P%"),
+            ("ft_pct", "FT%"),
+            ("rebounds", "REB"),
+            ("assists", "AST"),
+            ("steals", "STL"),
+            ("blocks", "BLK"),
+            ("turnovers", "TOV"),
+            ("off_rating", "OFFRTG"),
+            ("def_rating", "DEFRTG"),
+            ("net_rating", "NETRTG"),
+            ("usage_pct", "USG%"),
+            ("pie", "PIE"),
+        )
+    ),
+)
+PLAYER_COLUMNS = tuple(field for field, _, _ in PLAYER_FIELD_MAP)
+MATCH_COLUMNS = tuple("team_code team_name players_count team_points_total team_games_played team_wins team_losses source_sheet".split())
+STAT_INSERT_COLUMNS = tuple("player_id match_id stat_key stat_value unit source_sheet".split())
+REPORT_COLUMNS = tuple("report_type title content source_sheet row_order".split())
+
+
+def _build_payload(row: Any, field_map: tuple[tuple[str, str, Any], ...]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    getter = row.get if hasattr(row, "get") else None
+    for field_name, source_name, converter in field_map:
+        raw_value = getter(source_name) if getter else row[source_name]
+        payload[field_name] = converter(raw_value) if callable(converter) else raw_value
+    return payload
+
+
+def _validate_model(model_cls: type[BaseModel], payload: dict[str, Any]) -> BaseModel | None:
+    try:
+        return model_cls.model_validate(payload)
+    except ValidationError:
+        return None
+
+
+def _record_tuples(
+    rows: list[BaseModel],
+    columns: tuple[str, ...],
+    extra_values: dict[str, Any] | None = None,
+) -> list[tuple[Any, ...]]:
+    extras = extra_values or {}
+    return [
+        tuple(extras[column] if column in extras else getattr(row, column) for column in columns)
+        for row in rows
+    ]
+
+
+def _execute_upsert(
+    conn: sqlite3.Connection,
+    *,
+    table: str,
+    columns: tuple[str, ...],
+    rows: list[tuple[Any, ...]],
+    conflict_target: str | None = None,
+    update_columns: tuple[str, ...] = (),
+) -> None:
+    if not rows:
+        return
+
+    placeholders = ", ".join("?" for _ in columns)
+    sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})"
+    if conflict_target and update_columns:
+        updates = ", ".join(f"{column} = excluded.{column}" for column in update_columns)
+        sql += f" ON CONFLICT({conflict_target}) DO UPDATE SET {updates}"
+    conn.executemany(f"{sql};", rows)
+
+
+def _lookup_map(conn: sqlite3.Connection, table: str, id_column: str, key_column: str) -> dict[str, int]:
+    query = f"SELECT {id_column}, {key_column} FROM {table}"
+    return {row[1]: row[0] for row in conn.execute(query).fetchall()}
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _append_report(
+    reports: list[ReportRow],
+    row_order: int,
+    *,
+    report_type: str,
+    title: str,
+    content: str,
+    source_sheet: str,
+) -> int:
+    reports.append(
+        ReportRow(
+            report_type=report_type,
+            title=title,
+            content=content,
+            source_sheet=source_sheet,
+            row_order=row_order,
+        )
+    )
+    return row_order + 1
+
+
 def _init_db(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.executescript(
@@ -265,33 +374,9 @@ def _load_players(excel_path: Path) -> list[PlayerRow]:
 
     players: list[PlayerRow] = []
     for _, row in df.iterrows():
-        payload = {
-            "player_name": row.get("Player"),
-            "team_code": row.get("Team"),
-            "age": _to_int(row.get("Age")),
-            "gp": _to_int(row.get("GP")),
-            "wins": _to_int(row.get("W")),
-            "losses": _to_int(row.get("L")),
-            "minutes": _to_float(row.get("Min")),
-            "points_total": _to_float(row.get("PTS")),
-            "fg_pct": _to_float(row.get("FG%")),
-            "three_pt_pct": _to_float(row.get("3P%")),
-            "ft_pct": _to_float(row.get("FT%")),
-            "rebounds": _to_float(row.get("REB")),
-            "assists": _to_float(row.get("AST")),
-            "steals": _to_float(row.get("STL")),
-            "blocks": _to_float(row.get("BLK")),
-            "turnovers": _to_float(row.get("TOV")),
-            "off_rating": _to_float(row.get("OFFRTG")),
-            "def_rating": _to_float(row.get("DEFRTG")),
-            "net_rating": _to_float(row.get("NETRTG")),
-            "usage_pct": _to_float(row.get("USG%")),
-            "pie": _to_float(row.get("PIE")),
-        }
-        try:
-            players.append(PlayerRow.model_validate(payload))
-        except ValidationError:
-            continue
+        player = _validate_model(PlayerRow, _build_payload(row, PLAYER_FIELD_MAP))
+        if player is not None:
+            players.append(player)
     return players
 
 
@@ -382,17 +467,14 @@ def _load_reports() -> list[ReportRow]:
                     continue
 
                 file_had_text = True
-                normalized = re.sub(r"\s+", " ", content).strip()
-                reports.append(
-                    ReportRow(
-                        report_type="reddit_pdf",
-                        title=f"{pdf_path.stem} - page {page_idx}",
-                        content=normalized,
-                        source_sheet=pdf_path.name,
-                        row_order=row_order,
-                    )
+                row_order = _append_report(
+                    reports,
+                    row_order,
+                    report_type="reddit_pdf",
+                    title=f"{pdf_path.stem} - page {page_idx}",
+                    content=_normalize_text(content),
+                    source_sheet=pdf_path.name,
                 )
-                row_order += 1
 
         # Fallback OCR si PDF image/scanné (cas fréquent sur les exports Reddit).
         if file_had_text:
@@ -406,131 +488,53 @@ def _load_reports() -> list[ReportRow]:
         if not ocr_text:
             page_count = len(reader.pages) if reader is not None else 1
             for page_idx in range(1, page_count + 1):
-                reports.append(
-                    ReportRow(
-                        report_type="reddit_pdf_unreadable",
-                        title=f"{pdf_path.stem} - page {page_idx}",
-                        content="Aucun texte extractible (PDF image/scanné, OCR indisponible).",
-                        source_sheet=pdf_path.name,
-                        row_order=row_order,
-                    )
+                row_order = _append_report(
+                    reports,
+                    row_order,
+                    report_type="reddit_pdf_unreadable",
+                    title=f"{pdf_path.stem} - page {page_idx}",
+                    content="Aucun texte extractible (PDF image/scanné, OCR indisponible).",
+                    source_sheet=pdf_path.name,
                 )
-                row_order += 1
             continue
 
-        normalized = re.sub(r"\s+", " ", ocr_text).strip()
-        reports.append(
-            ReportRow(
-                report_type="reddit_pdf_ocr",
-                title=f"{pdf_path.stem} - OCR complet",
-                content=normalized,
-                source_sheet=pdf_path.name,
-                row_order=row_order,
-            )
+        row_order = _append_report(
+            reports,
+            row_order,
+            report_type="reddit_pdf_ocr",
+            title=f"{pdf_path.stem} - OCR complet",
+            content=_normalize_text(ocr_text),
+            source_sheet=pdf_path.name,
         )
-        row_order += 1
 
     return reports
 
 
 def _insert_matches(conn: sqlite3.Connection, matches: list[MatchRow]) -> None:
-    conn.executemany(
-        """
-        INSERT INTO matches (
-            team_code, team_name, players_count, team_points_total,
-            team_games_played, team_wins, team_losses, source_sheet
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Analyse')
-        ON CONFLICT(team_code) DO UPDATE SET
-            team_name = excluded.team_name,
-            players_count = excluded.players_count,
-            team_points_total = excluded.team_points_total,
-            team_games_played = excluded.team_games_played,
-            team_wins = excluded.team_wins,
-            team_losses = excluded.team_losses;
-        """,
-        [
-            (
-                row.team_code,
-                row.team_name,
-                row.players_count,
-                row.team_points_total,
-                row.team_games_played,
-                row.team_wins,
-                row.team_losses,
-            )
-            for row in matches
-        ],
+    _execute_upsert(
+        conn,
+        table="matches",
+        columns=MATCH_COLUMNS,
+        rows=_record_tuples(matches, MATCH_COLUMNS, {"source_sheet": "Analyse"}),
+        conflict_target="team_code",
+        update_columns=MATCH_COLUMNS[1:],
     )
 
 
 def _insert_players(conn: sqlite3.Connection, players: list[PlayerRow]) -> None:
-    conn.executemany(
-        """
-        INSERT INTO players (
-            player_name, team_code, age, gp, wins, losses, minutes, points_total,
-            fg_pct, three_pt_pct, ft_pct, rebounds, assists, steals, blocks,
-            turnovers, off_rating, def_rating, net_rating, usage_pct, pie
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(player_name) DO UPDATE SET
-            team_code = excluded.team_code,
-            age = excluded.age,
-            gp = excluded.gp,
-            wins = excluded.wins,
-            losses = excluded.losses,
-            minutes = excluded.minutes,
-            points_total = excluded.points_total,
-            fg_pct = excluded.fg_pct,
-            three_pt_pct = excluded.three_pt_pct,
-            ft_pct = excluded.ft_pct,
-            rebounds = excluded.rebounds,
-            assists = excluded.assists,
-            steals = excluded.steals,
-            blocks = excluded.blocks,
-            turnovers = excluded.turnovers,
-            off_rating = excluded.off_rating,
-            def_rating = excluded.def_rating,
-            net_rating = excluded.net_rating,
-            usage_pct = excluded.usage_pct,
-            pie = excluded.pie;
-        """,
-        [
-            (
-                row.player_name,
-                row.team_code,
-                row.age,
-                row.gp,
-                row.wins,
-                row.losses,
-                row.minutes,
-                row.points_total,
-                row.fg_pct,
-                row.three_pt_pct,
-                row.ft_pct,
-                row.rebounds,
-                row.assists,
-                row.steals,
-                row.blocks,
-                row.turnovers,
-                row.off_rating,
-                row.def_rating,
-                row.net_rating,
-                row.usage_pct,
-                row.pie,
-            )
-            for row in players
-        ],
+    _execute_upsert(
+        conn,
+        table="players",
+        columns=PLAYER_COLUMNS,
+        rows=_record_tuples(players, PLAYER_COLUMNS),
+        conflict_target="player_name",
+        update_columns=PLAYER_COLUMNS[1:],
     )
 
 
 def _insert_stats(conn: sqlite3.Connection, players: list[PlayerRow]) -> int:
-    player_map = {
-        row[1]: row[0]
-        for row in conn.execute("SELECT player_id, player_name FROM players").fetchall()
-    }
-    match_map = {
-        row[1]: row[0]
-        for row in conn.execute("SELECT match_id, team_code FROM matches").fetchall()
-    }
+    player_map = _lookup_map(conn, "players", "player_id", "player_name")
+    match_map = _lookup_map(conn, "matches", "match_id", "team_code")
 
     rows: list[StatRow] = []
     for player in players:
@@ -553,46 +557,23 @@ def _insert_stats(conn: sqlite3.Connection, players: list[PlayerRow]) -> int:
                 )
             )
 
-    conn.executemany(
-        """
-        INSERT INTO stats (player_id, match_id, stat_key, stat_value, unit, source_sheet)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(player_id, match_id, stat_key) DO UPDATE SET
-            stat_value = excluded.stat_value,
-            unit = excluded.unit,
-            source_sheet = excluded.source_sheet;
-        """,
-        [
-            (
-                row.player_id,
-                row.match_id,
-                row.stat_key,
-                row.stat_value,
-                row.unit,
-                row.source_sheet,
-            )
-            for row in rows
-        ],
+    _execute_upsert(
+        conn,
+        table="stats",
+        columns=STAT_INSERT_COLUMNS,
+        rows=_record_tuples(rows, STAT_INSERT_COLUMNS),
+        conflict_target="player_id, match_id, stat_key",
+        update_columns=("stat_value", "unit", "source_sheet"),
     )
     return len(rows)
 
 
 def _insert_reports(conn: sqlite3.Connection, reports: list[ReportRow]) -> None:
-    conn.executemany(
-        """
-        INSERT INTO reports (report_type, title, content, source_sheet, row_order)
-        VALUES (?, ?, ?, ?, ?);
-        """,
-        [
-            (
-                report.report_type,
-                report.title,
-                report.content,
-                report.source_sheet,
-                report.row_order,
-            )
-            for report in reports
-        ],
+    _execute_upsert(
+        conn,
+        table="reports",
+        columns=REPORT_COLUMNS,
+        rows=_record_tuples(reports, REPORT_COLUMNS),
     )
 
 

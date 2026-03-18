@@ -10,7 +10,10 @@ from typing import Any
 import numpy as np
 from tqdm import tqdm
 
+from .config import get_settings
+
 LOGGER = logging.getLogger(__name__)
+SETTINGS = get_settings()
 
 try:
     import fitz  # PyMuPDF
@@ -32,11 +35,15 @@ def _get_easyocr_reader():
         return _easyocr_reader
     if _easyocr_failed:
         return None
+    if not SETTINGS.easyocr_enabled:
+        LOGGER.info("EasyOCR désactivé (EASYOCR_ENABLED=false).")
+        _easyocr_failed = True
+        return None
     try:
         import easyocr
 
-        LOGGER.info("Initialisation EasyOCR...")
-        _easyocr_reader = easyocr.Reader(["en", "fr"], gpu=False)
+        LOGGER.info("Initialisation EasyOCR (gpu=%s)...", SETTINGS.easyocr_gpu)
+        _easyocr_reader = easyocr.Reader(["en", "fr"], gpu=SETTINGS.easyocr_gpu)
         return _easyocr_reader
     except Exception as exc:
         LOGGER.warning("EasyOCR indisponible: %s", exc)
@@ -83,7 +90,12 @@ def extract_text_from_pdf(file_path: str) -> str | None:
         if len(text) >= 100:
             return text
         LOGGER.info("Peu de texte extrait sur %s, fallback OCR...", file_path)
-        return _extract_text_from_pdf_with_ocr(file_path) or (text or None)
+        ocr_text = _extract_text_from_pdf_with_ocr(file_path)
+        if ocr_text:
+            return ocr_text
+        if text:
+            LOGGER.info("OCR indisponible ou désactivé sur %s, conservation du texte partiel.", file_path)
+        return text or None
     except Exception as exc:
         LOGGER.warning("Extraction PDF standard échouée sur %s: %s", file_path, exc)
         return _extract_text_from_pdf_with_ocr(file_path)

@@ -1,0 +1,100 @@
+[
+  {
+    "id": "q1",
+    "category": "simple",
+    "question": "Quel est le nom complet de l'équipe codée OKC ?",
+    "ground_truth": "OKC correspond à Oklahoma City Thunder.",
+    "retrieval_keywords": ["OKC", "Oklahoma City Thunder"]
+  },
+  {
+    "id": "q2",
+    "category": "simple",
+    "question": "Selon le tableau des équipes, combien de points totaux a OKC ?",
+    "ground_truth": "OKC totalise 9880 points.",
+    "retrieval_keywords": ["OKC", "9880"]
+  },
+  {
+    "id": "q3",
+    "category": "complex",
+    "question": "Parmi MIA, OKC, LAC et BKN, quelle équipe a le plus de points totaux ?",
+    "ground_truth": "Parmi ces quatre équipes, OKC est premier avec 9880 points.",
+    "retrieval_keywords": ["MIA", "OKC", "LAC", "BKN", "9880"]
+  },
+  {
+    "id": "q4",
+    "category": "complex",
+    "question": "Quelle est la différence de points totaux entre OKC (9880) et MIA (9828) ?",
+    "ground_truth": "La différence est de 52 points.",
+    "retrieval_keywords": ["OKC", "9880", "MIA", "9828", "52"]
+  },
+  {
+    "id": "q5",
+    "category": "simple",
+    "question": "Combien de joueurs compte l'équipe Brooklyn Nets (BKN) ?",
+    "ground_truth": "BKN compte 20 joueurs.",
+    "retrieval_keywords": ["Brooklyn Nets", "BKN", "20"]
+  },
+  {
+    "id": "q6",
+    "category": "simple",
+    "question": "Dans le top 15 des joueurs par points, combien de points totaux a Shai Gilgeous-Alexander ?",
+    "ground_truth": "Shai Gilgeous-Alexander affiche 2485 points totaux.",
+    "retrieval_keywords": ["Shai Gilgeous-Alexander", "2485"]
+  },
+  {
+    "id": "q7",
+    "category": "simple",
+    "question": "Quel est le pourcentage à 3 points (3P%) de Shai Gilgeous-Alexander dans ce tableau ?",
+    "ground_truth": "Le 3P% de Shai Gilgeous-Alexander est de 37.5.",
+    "retrieval_keywords": ["Shai Gilgeous-Alexander", "3P%", "37.5"]
+  },
+  {
+    "id": "q8",
+    "category": "complex",
+    "question": "Entre Anthony Edwards (2180) et Nikola Jokic (2072), qui a le plus de points totaux ?",
+    "ground_truth": "Anthony Edwards a le total le plus élevé avec 2180 points (contre 2072).",
+    "retrieval_keywords": ["Anthony Edwards", "2180", "Nikola Jokic", "2072"]
+  },
+  {
+    "id": "q9",
+    "category": "complex",
+    "question": "Entre Detroit Pistons (10292) et Cleveland Cavaliers (10180), quelle équipe a le plus de points totaux ?",
+    "ground_truth": "Detroit Pistons est devant avec 10292 points (contre 10180).",
+    "retrieval_keywords": ["Detroit Pistons", "10292", "Cleveland Cavaliers", "10180"]
+  },
+  {
+    "id": "q10",
+    "category": "noisy",
+    "question": "code MIA -> équipe + points ??? réponse rapide",
+    "ground_truth": "MIA correspond à Miami Heat et le total affiché est de 9828 points.",
+    "retrieval_keywords": ["MIA", "Miami Heat", "9828"]
+  },
+  {
+    "id": "q11",
+    "category": "hybrid",
+    "question": "Donne le nom complet de l'équipe devant entre OKC et MIA, puis l'écart de points exact.",
+    "ground_truth": "Oklahoma City Thunder est devant Miami Heat avec 52 points d'écart.",
+    "retrieval_keywords": ["OKC", "MIA", "Oklahoma City Thunder", "Miami Heat", "9880", "9828", "52"]
+  },
+  {
+    "id": "q12",
+    "category": "hybrid",
+    "question": "Entre Tyler Herro (1840) et Trae Young (1839), qui est devant et de combien ?",
+    "ground_truth": "Tyler Herro est devant Trae Young d'un point (1840 contre 1839).",
+    "retrieval_keywords": ["Tyler Herro", "1840", "Trae Young", "1839", "1"]
+  },
+  {
+    "id": "q13",
+    "category": "hybrid_noisy",
+    "question": "code BOS -> nom équipe + points totaux + nb joueurs ?",
+    "ground_truth": "BOS correspond à Boston Celtics avec 9551 points totaux et 17 joueurs.",
+    "retrieval_keywords": ["BOS", "Boston Celtics", "9551", "17"]
+  },
+  {
+    "id": "q14",
+    "category": "robustness_limit",
+    "question": "Compare les rebonds domicile vs extérieur pour MIA et donne la différence exacte.",
+    "ground_truth": "Les données domicile/extérieur ne sont pas disponibles dans le corpus fourni.",
+    "retrieval_keywords": ["MIA", "Miami Heat", "rebonds", "domicile", "extérieur"]
+  }
+]

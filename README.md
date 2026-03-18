@@ -18,6 +18,7 @@ Modules **présents** :
 - `load_excel_to_db.py`
 - `sql_tool.py`
 - `evaluate_ragas.py`
+- `eval_questions.json`
 - `notes_perso.ipynb`
 - `utils/config.py`, `utils/vector_store.py`, `utils/data_loader.py`
 
@@ -69,6 +70,8 @@ python -m pip install -r requirements.txt
 Créer un `.env` à la racine :
 ```bash
 MISTRAL_API_KEY=your_key_here
+EASYOCR_ENABLED=false
+EASYOCR_GPU=false
 LOGFIRE_ENABLED=false
 LOGFIRE_SEND_TO_LOGFIRE=false
 LOGFIRE_SERVICE_NAME=rag-nba
@@ -78,6 +81,12 @@ Notes Logfire :
 - `LOGFIRE_ENABLED=true` active l’instrumentation (API + pipeline d’évaluation).
 - `LOGFIRE_SEND_TO_LOGFIRE=true` envoie vers Logfire Cloud (pré-requis externe : config/token Logfire).
 - Par défaut (`false`), l’intégration reste locale et non bloquante.
+
+Note OCR :
+- `EASYOCR_ENABLED=false` désactive l'OCR par défaut, pour éviter les plantages natifs sur certaines stacks locales.
+- `EASYOCR_GPU=false` est le mode sûr par défaut, recommandé sur Mac.
+- `EASYOCR_ENABLED=true` réactive le fallback OCR si tu veux l'utiliser malgré ce risque.
+- `EASYOCR_GPU=true` force alors EasyOCR à tenter l'accélération matérielle, mais cela peut être instable selon la stack Torch/MPS.
 
 ## 5. Données d'entrée
 Données attendues (selon mission) :
@@ -113,6 +122,7 @@ Données attendues (selon mission) :
 
 ### `evaluate_ragas.py`
 - Évaluation automatisée RAGAS (profil core).
+- Charge son jeu de questions depuis `eval_questions.json`.
 - Validation Pydantic explicite des flux RAG : contextes, résultat SQL, réponse, échantillon, sortie de run.
 - Instrumentation Logfire optionnelle.
 - Génère :

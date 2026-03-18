@@ -1,4 +1,4 @@
-"""Evaluation RAG minimale en mode core (RAGAS + métriques retrieval).
+"""Évaluation RAG minimale en mode core (RAGAS + métriques retrieval).
 
 Ce script:
 1. génère des échantillons (question, contextes, réponse, métadonnées),
@@ -53,6 +53,7 @@ RAGAS_MAX_WAIT_SECONDS = 120
 RAGAS_MAX_WORKERS = 1
 RAGAS_BATCH_SIZE = 1
 STRICT_RAGAS_ERRORS = False
+QUESTIONS_PATH = Path("eval_questions.json")
 
 FRENCH_STOPWORDS = {
     "a",
@@ -112,107 +113,6 @@ FRENCH_STOPWORDS = {
     "votre",
     "vous",
 }
-
-DEFAULT_QUESTIONS: list[dict[str, Any]] = [
-    {
-        "id": "q1",
-        "category": "simple",
-        "question": "Quel est le nom complet de l'équipe codée OKC ?",
-        "ground_truth": "OKC correspond à Oklahoma City Thunder.",
-        "retrieval_keywords": ["OKC", "Oklahoma City Thunder"],
-    },
-    {
-        "id": "q2",
-        "category": "simple",
-        "question": "Selon le tableau des équipes, combien de points totaux a OKC ?",
-        "ground_truth": "OKC totalise 9880 points.",
-        "retrieval_keywords": ["OKC", "9880"],
-    },
-    {
-        "id": "q3",
-        "category": "complex",
-        "question": "Parmi MIA, OKC, LAC et BKN, quelle équipe a le plus de points totaux ?",
-        "ground_truth": "Parmi ces quatre équipes, OKC est premier avec 9880 points.",
-        "retrieval_keywords": ["MIA", "OKC", "LAC", "BKN", "9880"],
-    },
-    {
-        "id": "q4",
-        "category": "complex",
-        "question": "Quelle est la différence de points totaux entre OKC (9880) et MIA (9828) ?",
-        "ground_truth": "La différence est de 52 points.",
-        "retrieval_keywords": ["OKC", "9880", "MIA", "9828", "52"],
-    },
-    {
-        "id": "q5",
-        "category": "simple",
-        "question": "Combien de joueurs compte l'équipe Brooklyn Nets (BKN) ?",
-        "ground_truth": "BKN compte 20 joueurs.",
-        "retrieval_keywords": ["Brooklyn Nets", "BKN", "20"],
-    },
-    {
-        "id": "q6",
-        "category": "simple",
-        "question": "Dans le top 15 des joueurs par points, combien de points totaux a Shai Gilgeous-Alexander ?",
-        "ground_truth": "Shai Gilgeous-Alexander affiche 2485 points totaux.",
-        "retrieval_keywords": ["Shai Gilgeous-Alexander", "2485"],
-    },
-    {
-        "id": "q7",
-        "category": "simple",
-        "question": "Quel est le pourcentage à 3 points (3P%) de Shai Gilgeous-Alexander dans ce tableau ?",
-        "ground_truth": "Le 3P% de Shai Gilgeous-Alexander est de 37.5.",
-        "retrieval_keywords": ["Shai Gilgeous-Alexander", "3P%", "37.5"],
-    },
-    {
-        "id": "q8",
-        "category": "complex",
-        "question": "Entre Anthony Edwards (2180) et Nikola Jokic (2072), qui a le plus de points totaux ?",
-        "ground_truth": "Anthony Edwards a le total le plus élevé avec 2180 points (contre 2072).",
-        "retrieval_keywords": ["Anthony Edwards", "2180", "Nikola Jokic", "2072"],
-    },
-    {
-        "id": "q9",
-        "category": "complex",
-        "question": "Entre Detroit Pistons (10292) et Cleveland Cavaliers (10180), quelle équipe a le plus de points totaux ?",
-        "ground_truth": "Detroit Pistons est devant avec 10292 points (contre 10180).",
-        "retrieval_keywords": ["Detroit Pistons", "10292", "Cleveland Cavaliers", "10180"],
-    },
-    {
-        "id": "q10",
-        "category": "noisy",
-        "question": "code MIA -> équipe + points ??? réponse rapide",
-        "ground_truth": "MIA correspond à Miami Heat et le total affiché est de 9828 points.",
-        "retrieval_keywords": ["MIA", "Miami Heat", "9828"],
-    },
-    {
-        "id": "q11",
-        "category": "hybrid",
-        "question": "Donne le nom complet de l'équipe devant entre OKC et MIA, puis l'écart de points exact.",
-        "ground_truth": "Oklahoma City Thunder est devant Miami Heat avec 52 points d'écart.",
-        "retrieval_keywords": ["OKC", "MIA", "Oklahoma City Thunder", "Miami Heat", "9880", "9828", "52"],
-    },
-    {
-        "id": "q12",
-        "category": "hybrid",
-        "question": "Entre Tyler Herro (1840) et Trae Young (1839), qui est devant et de combien ?",
-        "ground_truth": "Tyler Herro est devant Trae Young d'un point (1840 contre 1839).",
-        "retrieval_keywords": ["Tyler Herro", "1840", "Trae Young", "1839", "1"],
-    },
-    {
-        "id": "q13",
-        "category": "hybrid_noisy",
-        "question": "code BOS -> nom équipe + points totaux + nb joueurs ?",
-        "ground_truth": "BOS correspond à Boston Celtics avec 9551 points totaux et 17 joueurs.",
-        "retrieval_keywords": ["BOS", "Boston Celtics", "9551", "17"],
-    },
-    {
-        "id": "q14",
-        "category": "robustness_limit",
-        "question": "Compare les rebonds domicile vs extérieur pour MIA et donne la différence exacte.",
-        "ground_truth": "Les données domicile/extérieur ne sont pas disponibles dans le corpus fourni.",
-        "retrieval_keywords": ["MIA", "Miami Heat", "rebonds", "domicile", "extérieur"],
-    },
-]
 
 
 def _sleep_between_requests() -> None:
@@ -394,11 +294,14 @@ def _validate_sample(sample: dict[str, Any]) -> dict[str, Any]:
 
 
 def _load_questions() -> list[dict[str, Any]]:
-    raw = DEFAULT_QUESTIONS
+    if not QUESTIONS_PATH.exists():
+        raise FileNotFoundError(f"Fichier de questions introuvable: {QUESTIONS_PATH}")
+
+    raw = json.loads(QUESTIONS_PATH.read_text(encoding="utf-8"))
     if isinstance(raw, dict) and "questions" in raw:
         raw = raw["questions"]
     if not isinstance(raw, list):
-        raise ValueError("DEFAULT_QUESTIONS doit être une liste (ou {'questions': [...]})")
+        raise ValueError("Le fichier de questions doit contenir une liste (ou {'questions': [...]})")
 
     normalized: list[dict[str, Any]] = []
     used_ids: set[str] = set()
@@ -447,7 +350,7 @@ def _build_sql_context(question: str) -> tuple[str, bool, str | None]:
         result = SQLToolResult.model_validate(answer_question_sql_via_langchain(question))
     except Exception as exc:
         logfire_event("error", "sql_tool_invalid", question=question, error=str(exc))
-        return f"Echec du tool SQL: {exc}", False, None
+        return f"Échec de l'outil SQL : {exc}", False, None
 
     if result.status == "no_tool":
         return result.message or "Aucun appel SQL jugé nécessaire.", False, None
@@ -493,7 +396,7 @@ def _generate_answer(
             usage = _extract_usage_tokens(response)
             return _validate_generated_answer(answer=answer, usage=usage, sample_id=sample_id)
     except Exception as exc:
-        LOGGER.exception("Echec de génération (sample=%s)", sample_id)
+        LOGGER.exception("Échec de génération (sample=%s)", sample_id)
         logfire_event("error", "generate_answer_failed", sample_id=sample_id, error=str(exc))
         return (
             f"Erreur de génération : {exc}",
@@ -577,7 +480,7 @@ def _build_samples(
             samples.append(sample)
 
         LOGGER.info(
-            "Echantillon genere %s (%s) - retrieval_queries=%s, contexts=%s",
+            "Échantillon généré %s (%s) - retrieval_queries=%s, contexts=%s",
             sample_id,
             question_row["category"],
             len(retrieval_queries),
@@ -593,33 +496,30 @@ def _build_samples(
     return samples
 
 
+def _empty_retrieval_metrics(keywords_count: int | None = None) -> dict[str, float | int | None]:
+    return {
+        "retrieval_precision_at_k": None,
+        "retrieval_recall_at_k": None,
+        "retrieval_mrr": None,
+        "retrieval_ndcg_at_k": None,
+        "retrieval_keyword_coverage": None,
+        "retrieval_keywords_count": keywords_count,
+    }
+
+
 def _compute_retrieval_metrics_for_sample(sample: dict[str, Any]) -> dict[str, float | int | None]:
     contexts = [str(ctx) for ctx in sample.get("contexts", []) if str(ctx).strip()]
     keywords = _resolve_retrieval_keywords(sample)
 
     if not contexts or not keywords:
-        return {
-            "retrieval_precision_at_k": None,
-            "retrieval_recall_at_k": None,
-            "retrieval_mrr": None,
-            "retrieval_ndcg_at_k": None,
-            "retrieval_keyword_coverage": None,
-            "retrieval_keywords_count": len(keywords),
-        }
+        return _empty_retrieval_metrics(len(keywords))
 
     normalized_contexts = [_normalize_text_for_match(ctx) for ctx in contexts]
     normalized_keywords = [_normalize_text_for_match(kw) for kw in keywords]
     normalized_keywords = [kw for kw in normalized_keywords if kw]
 
     if not normalized_keywords:
-        return {
-            "retrieval_precision_at_k": None,
-            "retrieval_recall_at_k": None,
-            "retrieval_mrr": None,
-            "retrieval_ndcg_at_k": None,
-            "retrieval_keyword_coverage": None,
-            "retrieval_keywords_count": 0,
-        }
+        return _empty_retrieval_metrics(0)
 
     per_context_relevance: list[float] = []
     covered_keywords: set[str] = set()
@@ -774,7 +674,7 @@ def _resolve_ragas_models() -> tuple[Any, Any]:
         if not isinstance(sanity_vec, list) or len(sanity_vec) == 0:
             raise RuntimeError("Sanity check embeddings invalide.")
     except Exception as exc:
-        raise RuntimeError("Echec du sanity check embeddings.") from exc
+        raise RuntimeError("Échec du sanity check embeddings.") from exc
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
@@ -946,7 +846,7 @@ def main() -> None:
 
     client = Mistral(api_key=SETTINGS.mistral_api_key)
     samples = _build_samples(questions=questions, retriever=retriever, client=client)
-    LOGGER.info("Echantillons générés : %s", len(samples))
+    LOGGER.info("Échantillons générés : %s", len(samples))
 
     try:
         LOGGER.info(
@@ -958,7 +858,7 @@ def main() -> None:
         summary, details = _run_ragas(samples)
     except Exception as exc:
         _save_outputs(samples=samples, summary=None, details=None)
-        LOGGER.error("Echec de l'évaluation RAGAS : %s", exc)
+        LOGGER.error("Échec de l'évaluation RAGAS : %s", exc)
         LOGGER.error("Les échantillons ont été sauvegardés pour diagnostic.")
         raise
 
