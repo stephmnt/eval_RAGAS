@@ -1,6 +1,11 @@
 # Rapport technique - système RAG NBA (Mistral + FAISS + SQL)
 
-Ce dépôt contient le prototype RAG demandé dans la mission, avec :
+[![GitHub Release Date](https://img.shields.io/github/release-date/stephmnt/eval_RAGAS?display_date=published_at&style=flat-square)](https://github.com/stephmnt/eval_RAGAS/releases)
+[![project_license](https://img.shields.io/github/license/stephmnt/eval_RAGAS.svg)](https://github.com/stephmnt/eval_RAGAS/blob/main/LICENSE)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-stephanemanet-0A66C2?logo=linkedin&logoColor=white)](https://linkedin.com/in/stephanemanet)
+
+Ce dépôt contient un prototype RAG avec :
+
 - un assistant Streamlit,
 - une API REST versionnée,
 - un pipeline d'ingestion Excel vers SQLite,
@@ -9,9 +14,11 @@ Ce dépôt contient le prototype RAG demandé dans la mission, avec :
 - un notebook de rapport d'évaluation.
 
 ## 1. État réel du repo et livrables
+
 Ce README reflète le dépôt réel (pas de modules fantômes).
 
 Modules **présents** :
+
 - `MistralChat.py`
 - `api.py`
 - `indexer.py`
@@ -23,10 +30,12 @@ Modules **présents** :
 - `utils/config.py`, `utils/vector_store.py`, `utils/data_loader.py`
 
 Modules **absents** (et donc non documentés comme actifs) :
+
 - `utils/database.py`
 - `utils/query_classifier.py`
 
 ## 2. Schéma d'architecture
+
 ```mermaid
 flowchart TD
     U[Utilisateur] -->|Question| S[Streamlit MistralChat.py]
@@ -54,12 +63,14 @@ flowchart TD
 ```
 
 ## 3. Prérequis
+
 - Python 3.9+
 - Clé API Mistral valide
 - Environnement virtuel recommandé
 - Logfire optionnel (désactivé par défaut)
 
 ## 4. Installation
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
@@ -68,6 +79,7 @@ python -m pip install -r requirements.txt
 ```
 
 Créer un `.env` à la racine :
+
 ```bash
 MISTRAL_API_KEY=your_key_here
 EASYOCR_ENABLED=false
@@ -78,49 +90,60 @@ LOGFIRE_SERVICE_NAME=rag-nba
 ```
 
 Notes Logfire :
+
 - `LOGFIRE_ENABLED=true` active l’instrumentation (API + pipeline d’évaluation).
 - `LOGFIRE_SEND_TO_LOGFIRE=true` envoie vers Logfire Cloud (pré-requis externe : config/token Logfire).
 - Par défaut (`false`), l’intégration reste locale et non bloquante.
 
 Note OCR :
+
 - `EASYOCR_ENABLED=false` désactive l'OCR par défaut, pour éviter les plantages natifs sur certaines stacks locales.
 - `EASYOCR_GPU=false` est le mode sûr par défaut, recommandé sur Mac.
 - `EASYOCR_ENABLED=true` réactive le fallback OCR si tu veux l'utiliser malgré ce risque.
 - `EASYOCR_GPU=true` force alors EasyOCR à tenter l'accélération matérielle, mais cela peut être instable selon la stack Torch/MPS.
 
 ## 5. Données d'entrée
+
 Données attendues (selon mission) :
+
 - Excel : `inputs/regular NBA.xlsx` (ou `matchs/regular+NBA.xlsx`)
 - PDFs Reddit : `inputs/Reddit 1.pdf` ... `inputs/Reddit 4.pdf`
 
 ## 6. Scripts livrés et rôle
+
 ### `indexer.py`
+
 - Construit l'index vectoriel FAISS à partir des documents du dossier `inputs/`.
 - Produit `vector_db/faiss_index.idx` + `vector_db/document_chunks.pkl`.
 
 ### `load_excel_to_db.py`
+
 - Lit l'Excel NBA.
 - Valide les lignes avec Pydantic.
 - Alimente SQLite : `players`, `matches`, `stats`.
 - Alimente `reports` à partir des PDFs Reddit (texte extractible ou fallback explicite si non extractible).
 
 ### `sql_tool.py`
+
 - Tool SQL LangChain (`StructuredTool`).
 - Génération SQL dynamique (few-shot + schéma DB).
 - Exécution SQL en lecture seule.
 - Routage outillé via `answer_question_sql_via_langchain`.
 
 ### `MistralChat.py`
+
 - Interface Streamlit.
 - Réutilise le service partagé `get_rag_service()` défini dans `api.py`.
 
 ### `api.py`
+
 - API REST FastAPI versionnée.
 - Contient le service partagé `RAGService` utilisé à la fois par l'API et Streamlit.
 - Validation Pydantic explicite des flux internes : contextes retrieval, résultat SQL, réponse générée, sortie API.
 - Instrumentation Logfire optionnelle.
 
 ### `evaluate_ragas.py`
+
 - Évaluation automatisée RAGAS (profil core).
 - Charge son jeu de questions depuis `eval_questions.json`.
 - Validation Pydantic explicite des flux RAG : contextes, résultat SQL, réponse, échantillon, sortie de run.
@@ -131,38 +154,47 @@ Données attendues (selon mission) :
   - `outputs/evaluations/ragas_details_*.csv`
 
 ### `notes_perso.ipynb`
+
 - Rapport d'analyse méthodologique.
 - Inclut comparatifs avant/après et visualisations.
 
 ## 7. Usage de la base SQLite
+
 Fichier DB : `database/nba_data.db`
 
 Tables principales :
+
 - `players`: stats agrégées joueur (points, % tirs, rebonds, etc.)
 - `matches`: agrégats équipe (code, nom, points totaux, bilan)
 - `stats`: métriques normalisées par clé (`stat_key`, `stat_value`)
 - `reports`: contenu textuel Reddit (ou marqueur explicite si PDF non extractible)
 
 Flux d'écriture/lecture :
+
 - **Écriture**: `load_excel_to_db.py`
 - **Lecture SQL**: `sql_tool.py`
 - **Lecture indirecte dans les réponses**: `MistralChat.py`, `api.py`, `evaluate_ragas.py`
 
 ## 8. API REST versionnée
+
 Lancer l'API :
+
 ```bash
 python -m uvicorn api:app --reload --port 8000
 ```
 
 Docs OpenAPI :
+
 - `http://localhost:8000/docs`
 - `http://localhost:8000/redoc`
 
 ### Endpoints v1 (cibles)
+
 - `GET /api/v1/health`
 - `POST /api/v1/ask`
 
 ### Format requête `/api/v1/ask`
+
 ```json
 {
   "question": "Entre OKC et MIA, quelle équipe a le plus de points totaux ?",
@@ -171,6 +203,7 @@ Docs OpenAPI :
 ```
 
 ### Format réponse `/api/v1/ask`
+
 ```json
 {
   "question": "...",
@@ -193,6 +226,7 @@ Docs OpenAPI :
 ```
 
 ### Exemple `curl`
+
 ```bash
 curl -X POST "http://localhost:8000/api/v1/ask" \
   -H "Content-Type: application/json" \
@@ -200,6 +234,7 @@ curl -X POST "http://localhost:8000/api/v1/ask" \
 ```
 
 ## 9. Exécution de bout en bout
+
 ```bash
 # 1) Construire l'index vectoriel
 python indexer.py
@@ -218,18 +253,22 @@ python evaluate_ragas.py
 ```
 
 ## 10.1 Tests rapides (sans appel réseau réel)
+
 ```bash
 pytest -q
 ```
 
 Le fichier `tests.py` couvre :
+
 - validateurs Pydantic du flux RAG,
 - contrat principal de l’API,
 - garde-fous SQL lecture seule,
 - validation d’ingestion (modèles Pydantic).
 
 ## 10. Évaluation et rapport
+
 Artefacts d'évaluation : `outputs/evaluations/`
+
 - `samples_*.json`
 - `ragas_summary_*.json`
 - `ragas_details_*.csv`
@@ -237,11 +276,13 @@ Artefacts d'évaluation : `outputs/evaluations/`
 Rapport d'analyse : `notes_perso.ipynb`
 
 ## 11. Limites connues
+
 - Les erreurs API Mistral (ex. 429) peuvent dégrader les scores d'évaluation.
 - Les PDF Reddit peuvent être image-only ; l'extraction texte dépend de la disponibilité OCR.
 - Les métriques automatiques RAGAS ne remplacent pas une validation humaine métier.
 
 ## 12. Dépendances conservées / nettoyées
+
 - `streamlit-feedback` retiré : non utilisé dans le code versionné.
 - `python-docx` retiré : aucun flux DOCX n'est implémenté dans le repo versionné.
 - `requests` retiré : aucune requête HTTP sortante n'est utilisée dans le code versionné.
